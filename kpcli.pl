@@ -20,9 +20,10 @@ use FileHandle;
 use Getopt::Long;
 use File::Basename;
 use Data::Dumper qw(Dumper);
-use Crypt::Rijndael; # non-core, libcrypt-rijndael-perl in Ubuntu
+use Crypt::Rijndael; # non-core, libcrypt-rijndael-perl on Ubuntu
+use Sort::Naturally; # non-core, libsort-naturally-perl on Ubuntu
+use Term::ReadKey;   # non-core, libterm-readkey-perl on Ubuntu
 use Term::ShellUI;   # non-core, needs Term::ReadLine::Gnu for command history
-use Term::ReadKey;   # non-core
 use File::KeePass;   # non-core
 $|=1;
 
@@ -31,7 +32,7 @@ my $DEBUG=0;
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "0.6";
+my $VERSION = "0.7";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -407,10 +408,25 @@ sub get_groups_and_entries {
     @entries = $k->find_entries({group_id => $id});
   }
 
-  @groups = sort {$a->{title} cmp $b->{title}} @groups;
-  @entries = sort {$a->{title} cmp $b->{title}} @entries;
+  @groups = sort group_sort @groups;
+  @entries = sort { ncmp($a->{title},$b->{title}); } @entries;
 
   return (\@groups,\@entries);
+}
+
+# A function to properly sort groups by title
+sub group_sort($$) {
+  my $a=shift @_;
+  my $b=shift @_;
+
+  # Backup at level=0 is a special case (KeePassX's Backup group)
+  if ($a->{title} eq 'Backup' && $a->{level} == 0) {
+    return 1;
+  } elsif ($b->{title} eq 'Backup' && $b->{level} == 0) {
+    return -1;
+  } else {
+    return ncmp($a->{title},$b->{title}); # Natural sort
+  }
 }
 
 # -------------------------------------------------------------------------
@@ -1434,6 +1450,8 @@ C<Crypt::Rijndael> - "apt-get install libcrypt-rijndael-perl" on Ubuntu
 
 C<Term::ReadKey>   - "apt-get install libterm-readkey-perl" on Ubuntu
 
+C<Sort::Naturally> - "apt-get install libsort-naturally-perl" on Ubuntu
+
 C<Term::ShellUI>   - not packaged on Ubuntu
 
 C<File::KeePass>   - not packaged on Ubuntu
@@ -1450,7 +1468,12 @@ the libterm-readline-gnu-perl package on Ubuntu.
 Only interoperability with KeePassX (http://www.keepassx.org/) has been
 tested.  File::KeePass seems to have a bug related to some "unknown" data
 that KeePassX stores in the *.kdb file. This program deletes those unknown
-data when saving, but I have been unable to find any ill-effect from that.
+data when saving. Research into libkpass http://libkpass.sourceforge.net/)
+has shown me that what File::KeePass classifies as "unknown" are the times
+for created/modified/accessed/expires as well as "flags" (id=9), but only
+for groups -- File::KeePass seems to handle those fields fine for entries.
+I have not found any ill-effect from dropping those fields when saving and
+so that is what kpcli does today to work around this File::KeePass bug.
 
 =head1 BUGS
 
@@ -1494,8 +1517,11 @@ fault here as there is no way to "hook" into its "exit on Ctrl-D" behavior.
  2010-Nov-29 - v0.4 - Fixed code to work w/out Term::ReadLine::Gnu.
                       Documented File::KeePass v0.1 hierarchy bug.
  2010-Nov-29 - v0.5 - Made find command case insensitive.
-                      Bigfix in new command (path regex problem).
+                      Bugfix in new command (path regex problem).
  2010-Nov-29 - v0.6 - Added lock file support; warn if a lock exists.
+ 2010-Dec-01 - v0.7 - Further documented the group fields that are
+                      dropped, in the CAVEATS section of the POD.
+                      Sort group and entry titles naturally.
 
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
