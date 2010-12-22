@@ -20,11 +20,11 @@ use FileHandle;
 use Getopt::Long;
 use File::Basename;
 use Data::Dumper qw(Dumper);
-use Crypt::Rijndael; # non-core, libcrypt-rijndael-perl on Ubuntu
-use Sort::Naturally; # non-core, libsort-naturally-perl on Ubuntu
-use Term::ReadKey;   # non-core, libterm-readkey-perl on Ubuntu
-use Term::ShellUI;   # non-core, needs Term::ReadLine::Gnu for command history
-use File::KeePass;   # non-core
+use Crypt::Rijndael;    # non-core, libcrypt-rijndael-perl on Ubuntu
+use Sort::Naturally;    # non-core, libsort-naturally-perl on Ubuntu
+use Term::ReadKey;      # non-core, libterm-readkey-perl on Ubuntu
+use Term::ShellUI;      # non-core, add Term::ReadLine::Gnu for command history
+use File::KeePass 0.03; # non-core, >=v0.03 needed due critical bug fixes
 $|=1;
 
 my $DEBUG=0;
@@ -32,7 +32,7 @@ my $DEBUG=0;
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "0.7";
+my $VERSION = "0.8";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -211,7 +211,14 @@ print "\n" .
 	"Type 'help <command>' for details on individual commands.\n";
 if ($DEBUG) {print 'Using '.$term->{term}->ReadLine." for readline.\n"; }
 if (! $DEBUG && $term->{term}->ReadLine ne 'Term::ReadLine::Gnu') {
-  warn "Please install Term::ReadLine::Gnu for better functionality!\n";
+  warn "* Please install Term::ReadLine::Gnu for better functionality!\n";
+}
+# TODO - make sure my patch gets into 0.87 and then update this code.
+#if ($Term::ShellUI::VERSION >= 0.87) {
+if (Term::ShellUI->can('add_eof_exit_hook')) {
+  $term->add_eof_exit_hook(\&eof_exit_hook);
+} else {
+  warn "* Please upgrade Term::ShellUI to version 0.87 or newer.\n"; # TODO
 }
 print "\n";
 $term->run();
@@ -419,14 +426,22 @@ sub group_sort($$) {
   my $a=shift @_;
   my $b=shift @_;
 
-  # Backup at level=0 is a special case (KeePassX's Backup group)
-  if ($a->{title} eq 'Backup' && $a->{level} == 0) {
+  # _found at level 0 is a special case (from our find command).
+  if ($a->{title} eq '_found' && $a->{level} == 0) {
+    return 1;
+  } elsif ($b->{title} eq '_found' && $b->{level} == 0) {
+    return -1;
+  # Backup at level=0 is a special case (KeePassX's Backup group).
+  } elsif ($a->{title} eq 'Backup' && $a->{level} == 0) {
     return 1;
   } elsif ($b->{title} eq 'Backup' && $b->{level} == 0) {
     return -1;
+  # Sort everything else naturally (Sort::Naturally::ncmp).
   } else {
     return ncmp($a->{title},$b->{title}); # Natural sort
   }
+
+
 }
 
 # -------------------------------------------------------------------------
@@ -544,19 +559,41 @@ sub cli_find($) {
   my $found_group = $k->add_group({title => '_found'}); # root level group
   my $found_gid = $found_group->{'id'};
   $k->unlock;
-  foreach my $ent (@e) {
+  my @matches=();
+  FINDS: foreach my $ent (@e) {
     my %new_ent = %{$ent}; # Clone the entity
-    $new_ent{id} = int(rand(1000000000000000));
-    $new_ent{group} = $found_gid;
+    $new_ent{id} = int(rand(1000000000000000)); # A random new id
+    $new_ent{group} = $found_gid; # Place this entry clone into /_found
+    # $new_ent{path} is _NOT_ a normal key for File::KeePass but this is
+    # safe because we are adding it to entries in the /_found group which
+    # will not be saved to a file.
+    my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
+    $new_ent{path} = '/' . dirname(humanize_path($nulled_path)) . '/';
+    $new_ent{full_path} = humanize_path($nulled_path);
+    # We want to skip things found in the KeePassX /Backup group.
+    if ($new_ent{path} eq '/Backup/') {
+      next FINDS;
+    }
     $k->add_entry(\%new_ent);
+    push(@matches, \%new_ent);
   }
   $k->lock;
-
-  print " - " . scalar(@e) . " matches found and placed into /_found.\n";
 
   # Because we added a new /_found we must refresh our $state paths
   refresh_state_all_paths();
 
+  # Tell the user what we found
+  print " - " . scalar(@matches) . " matches found and placed into /_found.\n";
+
+  # If we only found one, ask the user if they want to see it
+  if (scalar(@matches) == 1) {
+    print "Would you like to show this entry? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) eq 'y') {
+      cli_show($self, { args => [ $matches[0]->{full_path} ] });
+    }
+  }
 }
 
 # Something is going wrong between KeePassX and File::KeePass related to
@@ -566,13 +603,16 @@ sub cli_find($) {
 # values before saving. If there is a downside to this on the KeePassX
 # side I've not found it yet. I do have an email out to Paul, the author
 # of File::KeePass, requesting some assistance in grokking the problem.
+#
+# NOTE: This should not be needed for File::Keepass >= 0.3
 sub scrub_unknown_values_from_all_groups {
   our $state;
   my $k=$state->{kdb};
   my @all_groups_flattened = $k->find_groups({});
   foreach my $g (@all_groups_flattened) {
     if (defined($g->{unknown})) {
-      #warn "Deleting unknown items from $g->{title}\n";
+      warn "Deleting unknown items from $g->{title}\n";
+      #warn "LHHD: " . &Dumper($g->{unknown}) . "\n";
       delete $g->{unknown};
     }
   }
@@ -601,12 +641,7 @@ sub cli_save($) {
                " A KeePassX-style lock file is in place for this file.\n" .
         "         It may be opened elsewhere. Save anyway? [y/N] " .
         $clear;
-    my $key='';
-    ReadMode('raw'); # Turn off controls keys
-    while (not defined ($key = ReadKey(-1))) {
-      # No key yet
-    }
-    ReadMode('restore');
+    my $key=get_single_key();
     print "\n";
     if (lc($key) ne 'y') {
       return;
@@ -619,11 +654,13 @@ sub cli_save($) {
   $state->{placed_lock_file} = $lock_file;
 
   # Scrub the data and write the file
-  scrub_unknown_values_from_all_groups();
+  destroy_found();
+  #scrub_unknown_values_from_all_groups(); # TODO - remove later
   my $k=$state->{kdb};
   $k->unlock;
   my $master_pass=$state->{get_master_passwd}();
   $k->save_db($state->{kdb_file},$master_pass);
+  $state->{kdb_has_changed}=0; # set our state to no change since last save
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
   print "Saved to $state->{kdb_file}\n";
   $k->lock;
@@ -791,8 +828,17 @@ sub cli_show($$) {
     return -1;
   }
 
+#  my $path='unknown';
+#  if (defined($state->{all_ent_paths_rev}->{$ent->{id}})) {
+#    $path=humanize_path($state->{all_ent_paths_rev}->{$ent->{id}});
+#  }
+
   $state->{kdb}->unlock;
-  print "\n" .
+  print "\n";
+  if (defined($ent->{path})) {
+    show_format("Path",$ent->{path}) . "\n";
+  }
+  print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
 	show_format("Pass",$ent->{password}) . "\n" .
@@ -949,8 +995,8 @@ sub cli_saveas($) {
     return;
   }
 
-  scrub_unknown_values_from_all_groups();
-
+  destroy_found();
+  #scrub_unknown_values_from_all_groups(); # TODO - remove later
   $state->{kdb}->unlock;
   $state->{kdb}->save_db($file,$master_pass);
   $state->{kdb}->lock;
@@ -1082,18 +1128,24 @@ sub cli_open($) {
   }
 }
 
+# Get a single keypress from the user
+sub get_single_key {
+  my $key='';
+  ReadMode('raw'); # Turn off controls keys
+  while (not defined ($key = ReadKey(-1))) {
+    # No key yet
+  }
+  ReadMode('restore');
+return $key;
+}
+
 sub cli_close {
   our $state;
 
   if ($state->{kdb_has_changed}) {
     print "WARNING: The database has changed and was not saved.\n" .
 	"Really close it? [y/N] ";
-    my $key='';
-    ReadMode('raw'); # Turn off controls keys
-    while (not defined ($key = ReadKey(-1))) {
-      # No key yet
-    }
-    ReadMode('restore');
+    my $key=get_single_key();
     print "\n";
     if (lc($key) ne 'y') {
       return;
@@ -1174,6 +1226,16 @@ sub get_human_entry_list($) {
   return \@list;
 }
 
+# Routine to hook into Term::ShellUI's exit on Ctrl-D functionality
+sub eof_exit_hook {
+  our $state;
+  # We need a newline if cli_quit() will talk tothe user about saving
+  if ($state->{kdb_has_changed}) { print "\n"; }
+  # cli_quit() will handle user interaction and return a value for
+  # the exit_hook of Term::ShellUI.
+  return cli_quit($state->{term},undef);
+}
+
 sub cli_quit($$) {
   my $self = shift @_;
   my $params = shift @_;
@@ -1182,21 +1244,17 @@ sub cli_quit($$) {
   if ($state->{kdb_has_changed}) {
     print "WARNING: The database has changed and was not saved.\n" .
 	"Really quit? [y/N] ";
-    my $key='';
-    ReadMode('raw'); # Turn off controls keys
-    while (not defined ($key = ReadKey(-1))) {
-      # No key yet
-    }
-    ReadMode('restore');
+    my $key=get_single_key();
     if (lc($key) ne 'y') {
       print "\n";
-      return;
+      return -1; # It is not OK to quit
     }
   }
 
   if (-f $state->{placed_lock_file}) { unlink($state->{placed_lock_file}); }
   delete($state->{placed_lock_file});
   $self->exit_requested(1);
+  return 0; # It's OK to quit
 }
 
 # Function to nag the user about saving each time the DB is modified
@@ -1215,12 +1273,7 @@ sub RequestSaveOnDBChange {
   }
 
   print "Database was modified. Do you want to save it now? [y/N]: ";
-  my $key='';
-  ReadMode('raw'); # Turn off controls keys
-  while (not defined ($key = ReadKey(-1))) {
-    # No key yet
-  }
-  ReadMode('restore');
+  my $key=get_single_key();
   print "\n";
   if (lc($key) ne 'y') {
     return;
@@ -1477,25 +1530,6 @@ so that is what kpcli does today to work around this File::KeePass bug.
 
 =head1 BUGS
 
-=head2 KeePass Database Group/Tree Hierarchy
-
-There is a bug in File::KeePass v0.1 that messes up the hierarchy if
-the tree moves "back" more than one level at a time. I tried to fix
-the bug but haven't had enough time to figure it out. For now, the bug
-is easy to work around. Envision these two hierarchies:
-
-            BREAKS                         WORKS
-     ----------------------         -----------------------
-          - personal                     - personal
-            - web                          - web
-              - shopping                     - shopping
-              - travel                       - travel
-          - work                           - zzz_kpcli_bug
-                                         - work
-
-I've reported the File::KeePass bug through rt.cpan.org and will also
-try again to fix it myself when I have some time.
-
 =head2 Tab Completion
 
 Tab completion is not perfect. It has problems with some entries that
@@ -1503,11 +1537,19 @@ contain spaces, slashes, and/or backslashes. I don' know if I am doing
 something wrong or if Term::ShellUI may have some bugs in its command
 completion code.
 
-=head2 Using Ctrl-D to Exit
+=head2 Using Ctrl-D to Exit (TODO - may be resolved with new Term::ShellUI)
 
 Pressing Ctrl-D exits the program _without warning_ to the user if the
 database has been changed and not saved. Term::ShellUI seems to be at
 fault here as there is no way to "hook" into its "exit on Ctrl-D" behavior.
+
+=head1 AUTHOR
+
+Lester Hightower <hightowe at cpan dot org>
+
+=head1 LICENSE
+
+This module may be distributed under the same terms as Perl itself.
 
 =head1 CHANGELOG
 
@@ -1522,6 +1564,14 @@ fault here as there is no way to "hook" into its "exit on Ctrl-D" behavior.
  2010-Dec-01 - v0.7 - Further documented the group fields that are
                       dropped, in the CAVEATS section of the POD.
                       Sort group and entry titles naturally.
+ 2010-Dec-23 - v0.8 - Worked with File::KeePass author to fix a couple
+                      of bugs and then required >=v0.03 of that module.
+                      Sorted "/_found" to last in the root group list.
+                      Fixed a "database changed" state bug in cli_save().
+                      Made the find command ignore entries in /Backup/.
+                      Find now offers show when only one entry is found.
+                      TODO - Provided patch to Term::ShellUI author to
+                      add eof_exit_hook and added support for it here.
 
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
