@@ -32,7 +32,7 @@ my $DEBUG=0;
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "0.8";
+my $VERSION = "0.9";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -279,7 +279,7 @@ sub open_kdb($) {
   refresh_state_all_paths();
 
   # Initialize our state into "/"
-  cli_cd($term, {'rawline' => "cd /"});
+  cli_cd($term, {'args' => ["/"]});
 
   return ''; # If we return anything else it is an error message
 }
@@ -457,14 +457,14 @@ sub cli_cd {
   my $params = shift @_;
   our $state;
 
-  my ($cd_cmd,$raw_pathstr)=split(/\s+/,$params->{'rawline'},2);
+  my $raw_pathstr = $params->{args}->[0];
   # "cd ."
   if ($raw_pathstr =~ m/^[.]$/) {
     return; # nothing to do
   }
   # "cd -"
   if ($raw_pathstr =~ m/^[-]$/) {
-    return cli_cd($self, {'rawline' => "cd $state->{oldpwd}"});
+    return cli_cd($self, {'args' => [$state->{oldpwd}]});
   }
   # Everything else is handled by helpers
   return cli_cd_helper($state,normalize_path_string($raw_pathstr));
@@ -604,14 +604,18 @@ sub cli_find($) {
 # side I've not found it yet. I do have an email out to Paul, the author
 # of File::KeePass, requesting some assistance in grokking the problem.
 #
-# NOTE: This should not be needed for File::Keepass >= 0.3
+# NOTE: I thought that this should not be needed for File::Keepass >= 0.3,
+#       but on 2011-02-02 I discovered that creating new groups with
+#       File::Keepass and not scrubbing on save created corrupt files:
+#               "Group header offset is out of range" errors.
+#       Sourceforge bug# 3187054 demonstrated the problem as well.
 sub scrub_unknown_values_from_all_groups {
   our $state;
   my $k=$state->{kdb};
   my @all_groups_flattened = $k->find_groups({});
   foreach my $g (@all_groups_flattened) {
     if (defined($g->{unknown})) {
-      warn "Deleting unknown items from $g->{title}\n";
+      warn "Deleting unknown fields from group $g->{title}\n";
       #warn "LHHD: " . &Dumper($g->{unknown}) . "\n";
       delete $g->{unknown};
     }
@@ -655,7 +659,7 @@ sub cli_save($) {
 
   # Scrub the data and write the file
   destroy_found();
-  #scrub_unknown_values_from_all_groups(); # TODO - remove later
+  scrub_unknown_values_from_all_groups(); # TODO - remove later
   my $k=$state->{kdb};
   $k->unlock;
   my $master_pass=$state->{get_master_passwd}();
@@ -864,6 +868,7 @@ sub cli_edit($) {
 
   # Loop through the fields taking edits the user wants to make
   my @fields = get_entry_fields();
+  my $had_changes=0;
   foreach my $input (@fields) {
     if ($input->{hide_entry}) {
       print $input->{txt} . ": ";
@@ -891,8 +896,16 @@ sub cli_edit($) {
       $state->{kdb}->unlock;
       $ent->{$input->{key}} = $val;
       $state->{kdb}->lock;
+      $had_changes=1;
     }
     ReadMode(0); # Return to normal
+  }
+
+  # If the use made changes, prompt them to save
+  if ($had_changes) {
+    refresh_state_all_paths();
+    $state->{kdb_has_changed}=1;
+    RequestSaveOnDBChange();
   }
 
 return 0;
@@ -996,7 +1009,7 @@ sub cli_saveas($) {
   }
 
   destroy_found();
-  #scrub_unknown_values_from_all_groups(); # TODO - remove later
+  scrub_unknown_values_from_all_groups(); # TODO - remove later
   $state->{kdb}->unlock;
   $state->{kdb}->save_db($file,$master_pass);
   $state->{kdb}->lock;
@@ -1039,7 +1052,7 @@ sub cli_rmdir($) {
   my $params = shift @_;
   our $state;
 
-  my ($mkdir_cmd,$raw_pathstr)=split(/\s+/,$params->{'rawline'},2);
+  my $raw_pathstr=$params->{'args'}->[0];
   my ($path,$grp_name) = normalize_and_split_raw_path($raw_pathstr);
 
   # Make sure the group exists.
@@ -1074,7 +1087,7 @@ sub cli_mkdir($) {
   my $params = shift @_;
   our $state;
 
-  my ($mkdir_cmd,$raw_pathstr)=split(/\s+/,$params->{'rawline'},2);
+  my $raw_pathstr = $params->{args}->[0];
   my ($path,$newdir) = normalize_and_split_raw_path($raw_pathstr);
 
   # Make sure the group doesn't already exist.
@@ -1158,7 +1171,7 @@ sub cli_close {
   delete($state->{placed_lock_file});
   delete($state->{kdb_file});
   delete($state->{master_pass});
-  cli_cd($term, {'rawline' => "cd /"});
+  cli_cd($term, {'args' => ["/"]});
 }
 
 sub cli_ls($) {
@@ -1166,13 +1179,13 @@ sub cli_ls($) {
   my $params = shift @_;
   our $state;
 
-  my ($ls_cmd,$path)=split(/\s+/,$params->{'rawline'},2);
+  my $path=$params->{'args'}->[0];
 
   # If we were given a path, use cli_cd() to go there temporarily...
   my $old_path='';
   if (length($path)) {
     $old_path=get_pwd();
-    if (cli_cd($term, {'rawline' => "cd $path"})) {
+    if (cli_cd($term, {'args' => [$path]})) {
       return -1; # If cli_cd() returned non-zero it failed
     }
   }
@@ -1191,7 +1204,7 @@ sub cli_ls($) {
 
   # If we temporarily cd'ed, cd back.
   if (length($old_path)) {
-    cli_cd($term, {'rawline' => "cd $old_path"});
+    cli_cd($term, {'args' => [$old_path]});
   }
 
   return 0;
@@ -1522,9 +1535,9 @@ Only interoperability with KeePassX (http://www.keepassx.org/) has been
 tested.  File::KeePass seems to have a bug related to some "unknown" data
 that KeePassX stores in the *.kdb file. This program deletes those unknown
 data when saving. Research into libkpass http://libkpass.sourceforge.net/)
-has shown me that what File::KeePass classifies as "unknown" are the times
-for created/modified/accessed/expires as well as "flags" (id=9), but only
-for groups -- File::KeePass seems to handle those fields fine for entries.
+has revealed what File::KeePass classifies as "unknown" are the times for
+created/modified/accessed/expires as well as "flags" (id=9), but only for
+groups -- File::KeePass seems to handle those fields just fine for entries.
 I have not found any ill-effect from dropping those fields when saving and
 so that is what kpcli does today to work around this File::KeePass bug.
 
@@ -1570,8 +1583,22 @@ This module may be distributed under the same terms as Perl itself.
                       Fixed a "database changed" state bug in cli_save().
                       Made the find command ignore entries in /Backup/.
                       Find now offers show when only one entry is found.
-                      TODO - Provided patch to Term::ShellUI author to
-                      add eof_exit_hook and added support for it here.
+                      Provided a patch to Term::ShellUI author to add
+                      eof_exit_hook and added support for it to kpcli.
+ 2011-Feb-19 - v0.9 - Fixed bugs related to spaces in group names as
+                      reported in SourceForge bug number 3132258.
+                      The edit command now prompts to save on changes.
+                      Put scrub_unknown_values_from_all_groups() calls
+                      back into place after realizing that v0.03 of
+                      File::KeePass did not resolve all of the problems.
+
+=head1 TODO ITEMS
+
+ Keep following up on the Term::ShellUI eof_exit_hook patch that I
+ submitted, hoping to see it show up in version 0.87.
+
+ Handle Ctrl-C presses (complicated by Term::ShellUI)
+  - http://mail.pm.org/pipermail/melbourne-pm/2007-January/002214.html
 
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
