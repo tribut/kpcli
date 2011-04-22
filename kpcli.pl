@@ -4,7 +4,7 @@
 #
 # kpcli - KeePass Command Line Interface
 #
-# Author: Lester Hightower / November 2010
+# Author: Lester Hightower <hightowe _over_at_ cpan.org>
 #
 # This program was inspired by "kedpm -c" and resulted despite illness
 # (or more likely because of it) over the USA Thanksgiving holiday in
@@ -15,24 +15,27 @@
 #
 ###########################################################################
 
-use strict;
-use FileHandle;
-use Getopt::Long;
-use File::Basename;
-use Data::Dumper qw(Dumper);
-use Crypt::Rijndael;    # non-core, libcrypt-rijndael-perl on Ubuntu
-use Sort::Naturally;    # non-core, libsort-naturally-perl on Ubuntu
-use Term::ReadKey;      # non-core, libterm-readkey-perl on Ubuntu
-use Term::ShellUI;      # non-core, add Term::ReadLine::Gnu for command history
-use File::KeePass 0.03; # non-core, >=v0.03 needed due critical bug fixes
+use strict;                  # core
+use FileHandle;              # core
+use Getopt::Long;            # core
+use File::Basename;          # core
+use Digest::file;            # core
+use Data::Dumper qw(Dumper); # core
+use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
+use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
+use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
+use Term::ShellUI;           # non-core, add Term::ReadLine::Gnu for cli history
+use File::KeePass 0.03;      # non-core, >=v0.03 needed due critical bug fixes
 $|=1;
 
 my $DEBUG=0;
+my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
+my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
 
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "0.9";
+my $VERSION = "1.0";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -42,7 +45,7 @@ my $term = new Term::ShellUI(
     history_file => "~/.$APP_NAME-history",
     keep_quotes => 0,
     commands => {
-         "" => { args => sub { shift->complete_history(@_) } },
+         #"" => { args => sub { shift->complete_history(@_) } },
          "history" => { desc => "Prints the command history",
             doc => "\nSpecify a number to list the last N lines of history" .
             "Pass -c to clear the command history, " .
@@ -176,6 +179,10 @@ my $term = new Term::ShellUI(
              desc => "Print the current working directory",
              maxargs => 0, proc => \&cli_pwd,
          },
+         "icons" => {
+             desc => "Change group or entry icons in the database",
+             maxargs => 0, proc => \&cli_icons,
+         },
          "quit" => {
              desc => "Quit this program (EOF and exit also work)",
              maxargs => 0, method => \&cli_quit,
@@ -213,12 +220,13 @@ if ($DEBUG) {print 'Using '.$term->{term}->ReadLine." for readline.\n"; }
 if (! $DEBUG && $term->{term}->ReadLine ne 'Term::ReadLine::Gnu') {
   warn "* Please install Term::ReadLine::Gnu for better functionality!\n";
 }
-# TODO - make sure my patch gets into 0.87 and then update this code.
-#if ($Term::ShellUI::VERSION >= 0.87) {
+# My patch made it into Term::ShellUI v0.9, but I still chose not to make
+# this script demand >=0.9 and instead look for the add_eof_exit_hook() and
+# use it if it exists and warn if not.
 if (Term::ShellUI->can('add_eof_exit_hook')) {
   $term->add_eof_exit_hook(\&eof_exit_hook);
 } else {
-  warn "* Please upgrade Term::ShellUI to version 0.87 or newer.\n"; # TODO
+  warn "* Please upgrade Term::ShellUI to version 0.9 or newer.\n";
 }
 print "\n";
 $term->run();
@@ -277,6 +285,9 @@ sub open_kdb($) {
 
   # Build the %all_grp_paths_fwd and %all_grp_paths_rev structures
   refresh_state_all_paths();
+
+  # Store the md5sum of the file so we can watch for unexpected changes
+  $state->{kdb_file_md5} = Digest::file::digest_file_hex($file, "MD5");
 
   # Initialize our state into "/"
   cli_cd($term, {'args' => ["/"]});
@@ -421,6 +432,25 @@ sub get_groups_and_entries {
   return (\@groups,\@entries);
 }
 
+# This function takes a group ID and returns all of the child
+# groups of that group, flattened.
+sub all_child_groups_flattened($) {
+  my $group_id=shift @_;
+  our $state;
+
+  my $k=$state->{kdb};
+  my @groups=();
+  my ($this_grp,@trash) = $k->find_groups({id=>$group_id});
+  if (defined($this_grp->{groups})) { # subgroups
+    @groups = @{$this_grp->{groups}};
+    foreach my $child_group (@groups) {
+      push @groups, all_child_groups_flattened($child_group->{id});
+    }
+  }
+
+  return @groups;
+}
+
 # A function to properly sort groups by title
 sub group_sort($$) {
   my $a=shift @_;
@@ -470,8 +500,8 @@ sub cli_cd {
   return cli_cd_helper($state,normalize_path_string($raw_pathstr));
 }
 
-# Takes a possible wacky path whit ".."'s and such and normalizes it into a
-# NULL-separated path that we can use as an index into $state->{all_grp_paths_fwd}
+# Takes a possibly wacky path with ".."s and such and normalizes it into a
+# NULL-separated path that can be used as a key into $state->{all_grp_paths_fwd}
 sub normalize_path_string($) {
   my $path_string = shift @_;
   our $state;
@@ -481,7 +511,8 @@ sub normalize_path_string($) {
   my $delim="/";
   my $escape="\\";
   my @path = $path_string =~
-		/(?:\Q$delim\E|^)((?:\Q$escape\E.|(?!\Q$delim\E).)*+)/gs;
+	/(?:\Q$delim\E|^)((?>(?:\Q$escape\E.|(?!\Q$delim\E).)*))/gs;
+	#/(?:\Q$delim\E|^)((?:\Q$escape\E.|(?!\Q$delim\E).)*+)/gs; # perl 5.10+
   s/\Q$escape$delim\E/$delim/g for @path;
   @path=grep(!/^$/, @path); # Drop meaningless (excess) deimiters (/foo//bar)
 
@@ -548,7 +579,14 @@ sub cli_find($) {
   }
   $search_str=join('', @letters);
 
-  my @e = $k->find_entries({'title =~' => "$search_str"});
+  # Search entries by title, skipping the KeePassX /Backup group if it exists
+  my $search_params = { 'title =~' => $search_str };
+  my $backup_dir_normalized=normalize_path_string("Backup"); # /Backup
+  if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
+    $search_params->{'group_id !'} =
+		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
+  }
+  my @e = $k->find_entries($search_params);
 
   if ( scalar(@e) < 1) {
     print "No matches.\n";
@@ -570,10 +608,6 @@ sub cli_find($) {
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
     $new_ent{path} = '/' . dirname(humanize_path($nulled_path)) . '/';
     $new_ent{full_path} = humanize_path($nulled_path);
-    # We want to skip things found in the KeePassX /Backup group.
-    if ($new_ent{path} eq '/Backup/') {
-      next FINDS;
-    }
     $k->add_entry(\%new_ent);
     push(@matches, \%new_ent);
   }
@@ -631,6 +665,10 @@ sub cli_save($) {
     return;
   }
 
+  if (warn_if_file_changed()) {
+    return;
+  }
+
   # Check for a lock file that we did not place there
   my $lock_file = $state->{kdb_file} . '.lock'; # KeePassX style
   if (-f $lock_file && $state->{placed_lock_file} ne $lock_file) {
@@ -668,12 +706,20 @@ sub cli_save($) {
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
   print "Saved to $state->{kdb_file}\n";
   $k->lock;
+
+  # Update the md5sum of the file after we just saved it
+  my $file = $state->{kdb_file};
+  $state->{kdb_file_md5} = Digest::file::digest_file_hex($file, "MD5");
 }
 
 sub cli_rm($) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (warn_if_file_changed()) {
+    return;
+  }
 
   my $target = $params->{args}->[0];
   my $ent=find_target_entity_by_number_or_path($target);
@@ -747,6 +793,10 @@ sub cli_rename($$) {
   my $params = shift @_;
   our $state;
 
+  if (warn_if_file_changed()) {
+    return;
+  }
+
   my $target_dir = $params->{args}->[0];
   my $dir_normalized=normalize_path_string($target_dir);
   my $grp=undef;
@@ -778,6 +828,10 @@ sub cli_mv($$) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (warn_if_file_changed()) {
+    return;
+  }
 
   my $target_ent = $params->{args}->[0];
   my $ent=find_target_entity_by_number_or_path($target_ent);
@@ -847,6 +901,7 @@ sub cli_show($$) {
 	show_format("Uname",$ent->{username}) . "\n" .
 	show_format("Pass",$ent->{password}) . "\n" .
 	show_format("URL",$ent->{url}) . "\n" .
+	show_format("Icon#",$ent->{icon}) . "\n" .
 	show_format("Notes",$ent->{comment}) . "\n" .
 	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '') .
 	"\n";
@@ -858,6 +913,10 @@ sub cli_edit($) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (warn_if_file_changed()) {
+    return;
+  }
 
   my $target = $params->{args}->[0];
   my $ent=find_target_entity_by_number_or_path($target);
@@ -935,10 +994,85 @@ sub get_entry_fields {
   return @fields;
 }
 
+sub cli_icons($) {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  print "Change icons on Groups or Entries (g/e/Cancel)? ";
+  my $groups_or_entries=lc(get_single_key());
+  print "\n";
+  if ($groups_or_entries !~ m/^[ge]$/) { return; }
+
+  print "Change icons Here, Below here, or Globally (h/b/g/Cancel)? ";
+  my $glob_or_rel=lc(get_single_key());
+  print "\n";
+  if ($glob_or_rel !~ m/^[hgb]$/) { return; }
+
+  print "What would you line the new icon to be (0-64/Cancel)? ";
+  my $val = ReadLine(0);
+  chomp($val);
+  if ($val !~ m/^[0-9]+$/ || $val < 0 || $val > 64) {
+    print "Invalid icon number.\n";
+    return;
+  }
+
+  # This code fills @{$groups} or @{$entries} with the items that the
+  # user wants to change the icons on.
+  my ($groups,$entries) = ([],[]);
+  if ($glob_or_rel eq 'h') { # "Here" is easy -- we have a function for that.
+    ($groups,$entries) = get_current_groups_and_entries();
+    if ($groups_or_entries eq 'e') {
+      $groups = [];
+    } else {
+      $entries = [];
+    }
+  } else {
+    if ($glob_or_rel eq 'g') { # Globally is easy, it's all groups
+      my $k=$state->{kdb};
+      @{$groups} = $k->find_groups({});
+    } else {
+      my $id=$state->{path}->{id};
+      @{$groups} = all_child_groups_flattened($id); # *only child groups*
+    }
+    # If the user wanted to operate on entries, collect all the entries
+    # in the @{$groups} and then empty @{$groups}.
+    if ($groups_or_entries eq 'e') {
+      foreach my $group (@{$groups}) {
+        if (defined($group->{entries})) {
+          push @{$entries}, @{$group->{entries}};
+        }
+      }
+      $groups = [];
+    }
+  }
+
+  # Change the items, recording the number of changes.
+  my $items_changed=0;
+  foreach my $item (@{$groups}, @{$entries}) {
+    $item->{icon} = $val;
+    $items_changed++;
+  }
+
+  # Tell the user what we did.
+  print "The icon value was set to $val on $items_changed records.\n";
+
+  # If we changed anything, ask the user if they want to save
+  if ($items_changed > 0) {
+    $state->{kdb_has_changed}=1;
+    RequestSaveOnDBChange();
+  }
+  return 0;
+}
+
 sub cli_new($) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (warn_if_file_changed()) {
+    return;
+  }
 
   my $pwd=get_pwd();
   if ($pwd =~ m/^\/+$/) {
@@ -948,7 +1082,7 @@ sub cli_new($) {
 
   print "Adding new entry to \"$pwd\"\n";
 
-  # Grab the entries as this $id (pwd) so we can check for conflicts
+  # Grab the entries at this $id (pwd) so we can check for conflicts
   my $k=$state->{kdb};
   my $id=$state->{path}->{id};
   my ($this_grp,@trash) = $k->find_groups({id=>$id});
@@ -967,6 +1101,10 @@ sub cli_new($) {
     my $val = ReadLine(0);
     if ($input->{hide_entry}) { print "\n"; }
     chomp $val;
+    # If the user gave us an empty title, abort the new entry
+    if ($input->{key} eq 'title' && length($val) == 0) {
+      return;
+    }
     if ($input->{double_entry_verify}) {
       print "Retype to verify: ";
       my $checkval = ReadLine(0);
@@ -980,6 +1118,7 @@ sub cli_new($) {
     $new_entry->{$input->{key}} = $val;
     ReadMode(0); # Return to normal
   }
+  $new_entry->{icon} = $DEFAULT_ENTRY_ICON;
 
   $k->unlock;
   my $new_entry_ref = $k->add_entry($new_entry);
@@ -991,7 +1130,7 @@ sub cli_new($) {
   } else {
     print "Failed to add new entry.\n";
   }
-
+  return 0;
 }
 
 sub cli_saveas($) {
@@ -1052,6 +1191,10 @@ sub cli_rmdir($) {
   my $params = shift @_;
   our $state;
 
+  if (warn_if_file_changed()) {
+    return;
+  }
+
   my $raw_pathstr=$params->{'args'}->[0];
   my ($path,$grp_name) = normalize_and_split_raw_path($raw_pathstr);
 
@@ -1087,6 +1230,10 @@ sub cli_mkdir($) {
   my $params = shift @_;
   our $state;
 
+  if (warn_if_file_changed()) {
+    return;
+  }
+
   my $raw_pathstr = $params->{args}->[0];
   my ($path,$newdir) = normalize_and_split_raw_path($raw_pathstr);
 
@@ -1103,12 +1250,14 @@ sub cli_mkdir($) {
   if ($path eq '') {
     $group = $state->{kdb}->add_group({
         title => $newdir,
+	icon => $DEfAULT_GROUP_ICON,
     }); # root level group
   } elsif (defined($state->{all_grp_paths_fwd}->{$path})) {
     my $group_id=$state->{all_grp_paths_fwd}->{$path};
     $group = $state->{kdb}->add_group({
 		title => $newdir,
 		group => $group_id,
+		icon => $DEfAULT_GROUP_ICON,
 	});
   } else {
     print "Cannot make directory at path " . humanize_path($path) . "\n";
@@ -1473,6 +1622,34 @@ sub get_master_passwd($) {
   }
 }
 
+# This routine checks to see if the file has changed on disk and warns if so
+sub warn_if_file_changed {
+  our $state;
+
+  my $file = $state->{kdb_file};
+  my $file_md5 = Digest::file::digest_file_hex($file, "MD5");
+  if ($state->{kdb_file_md5} ne $file_md5) {
+    my $bold="\e[1m";
+    my $red="\e[31m";
+    my $yellow="\e[33m";
+    my $clear="\e[0m";
+    print $bold . $yellow .
+        "WARNING:" .
+        $clear .
+        $red .
+               " The file has changed on disk since kpcli opened it!\n" .
+        "         It may be opened elsewhere. Continue anyway? [y/N] " .
+        $clear;
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
 ########################################################################
 # Unix-style, "touch" a file
 ########################################################################
@@ -1546,15 +1723,25 @@ so that is what kpcli does today to work around this File::KeePass bug.
 =head2 Tab Completion
 
 Tab completion is not perfect. It has problems with some entries that
-contain spaces, slashes, and/or backslashes. I don' know if I am doing
+contain spaces, slashes, and/or backslashes. I don't know if I am doing
 something wrong or if Term::ShellUI may have some bugs in its command
 completion code.
 
-=head2 Using Ctrl-D to Exit (TODO - may be resolved with new Term::ShellUI)
+=head2 Using Ctrl-D to Exit
 
-Pressing Ctrl-D exits the program _without warning_ to the user if the
-database has been changed and not saved. Term::ShellUI seems to be at
-fault here as there is no way to "hook" into its "exit on Ctrl-D" behavior.
+Versions of Term::ShellUI prior to v0.9. do not have the ability to trap
+Ctrl-D exits by the client program. I submitted a patch to remedy that
+and it made it into Term::ShellUI v0.9. Please upgrade if kpcli asks you to.
+
+=head2 Multiple Entries or Groups With the Same Name in the Same Group
+
+This program does not support multiple entries in the same group having the
+exact same name, nor does it support multiple groups at the same level
+having the same name, and it likely never will. KeepassX does support those
+and this program needs to be updated to detect and alert when an opened
+database file has those issues, and maybe refuse to save (overwrite) a
+file that is opened like that. Alternatively, we could alert and rename
+offending groups/entries at load time, by appending "-2", "-3", etc.
 
 =head1 AUTHOR
 
@@ -1562,7 +1749,7 @@ Lester Hightower <hightowe at cpan dot org>
 
 =head1 LICENSE
 
-This module may be distributed under the same terms as Perl itself.
+This program may be distributed under the same terms as Perl itself.
 
 =head1 CHANGELOG
 
@@ -1575,27 +1762,39 @@ This module may be distributed under the same terms as Perl itself.
                       Bugfix in new command (path regex problem).
  2010-Nov-29 - v0.6 - Added lock file support; warn if a lock exists.
  2010-Dec-01 - v0.7 - Further documented the group fields that are
-                      dropped, in the CAVEATS section of the POD.
+                       dropped, in the CAVEATS section of the POD.
                       Sort group and entry titles naturally.
  2010-Dec-23 - v0.8 - Worked with File::KeePass author to fix a couple
-                      of bugs and then required >=v0.03 of that module.
+                       of bugs and then required >=v0.03 of that module.
                       Sorted "/_found" to last in the root group list.
                       Fixed a "database changed" state bug in cli_save().
                       Made the find command ignore entries in /Backup/.
                       Find now offers show when only one entry is found.
                       Provided a patch to Term::ShellUI author to add
-                      eof_exit_hook and added support for it to kpcli.
+                       eof_exit_hook and added support for it to kpcli.
  2011-Feb-19 - v0.9 - Fixed bugs related to spaces in group names as
-                      reported in SourceForge bug number 3132258.
+                       reported in SourceForge bug number 3132258.
                       The edit command now prompts to save on changes.
                       Put scrub_unknown_values_from_all_groups() calls
-                      back into place after realizing that v0.03 of
+                       back into place after realizing that v0.03 of
                       File::KeePass did not resolve all of the problems.
+ 2011-Apr-23 - v1.0 - Changed a perl 5.10+ regex to a backward-compatable
+                       one to resolve SourceForge bug # 3192413.
+                      Modified the way that the /Backup group is ignored
+                       by the find command to stop kpcli from croaking on
+                       multiple entries with the same name in that group.
+                       - Note: There is a more general bug here that
+                               needs addressing (see BUGS section).
+                      An empty title on new entry aborts the new entry.
+                      Changed kdb file are now detected/warned about.
+                      Tested against Term::ShellUI v0.9, which has my EOF
+                       hook patch, and updated kpcli comments about it.
+                      Term::ShellUI's complete_history() method was
+                       removed between v0.86 and v0.9 and so I removed
+                       kpli's call to it (Ctrl-r works for history).
+                      Added the "icons" commands.
 
 =head1 TODO ITEMS
-
- Keep following up on the Term::ShellUI eof_exit_hook patch that I
- submitted, hoping to see it show up in version 0.87.
 
  Handle Ctrl-C presses (complicated by Term::ShellUI)
   - http://mail.pm.org/pipermail/melbourne-pm/2007-January/002214.html
