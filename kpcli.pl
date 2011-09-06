@@ -31,11 +31,12 @@ $|=1;
 my $DEBUG=0;
 my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
 my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
+my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.0";
+my $VERSION = "1.1";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -171,7 +172,7 @@ my $term = new Term::ShellUI(
              desc => "Finds entries by Title",
              doc => "\n" .
 		"Searches for entries with the given search term\n" .
-		"in their title and places matches into \"/_found/\".\n",
+		"in their title and places matches into \"/$FOUND_DIR/\".\n",
              minargs => 1, maxargs => 1, args => "<search string>",
              method => \&cli_find,
          },
@@ -208,7 +209,7 @@ if (length($opts->{kdb})) {
     print "Error opening file: $err\n";
   }
 } else {
-  $state->{'kdb'} = File::KeePass->new;
+  new_kdb($state);
 }
 
 # Enter the interative kpcli shell session
@@ -281,6 +282,7 @@ sub open_kdb($) {
 
   $state->{kdb_file} = $file;
   $state->{put_master_passwd}($master_pass);
+  $state->{kdb_has_changed}=0;
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
   # Build the %all_grp_paths_fwd and %all_grp_paths_rev structures
@@ -371,13 +373,13 @@ sub destroy_found {
   our $state;
   # Look for an exising /_found and kill it if it exists
   my $k=$state->{kdb};
-  my $found_group=$k->find_group({level=>0,title=>'_found'});
+  my $found_group=$k->find_group({level=>0,title=>$FOUND_DIR});
   if (defined($found_group)) {
     my @oldents = $k->find_entries({group=>$found_group->{id}});
     foreach my $ent (@oldents) {
       $k->delete_entry({id => $ent->{id}});
     }
-    $k->delete_group({level=>0,title=>'_found'});
+    $k->delete_group({level=>0,title=>$FOUND_DIR});
 
     # Because we destroyed /_found we must refresh our $state paths
     refresh_state_all_paths();
@@ -457,9 +459,9 @@ sub group_sort($$) {
   my $b=shift @_;
 
   # _found at level 0 is a special case (from our find command).
-  if ($a->{title} eq '_found' && $a->{level} == 0) {
+  if ($a->{title} eq $FOUND_DIR && $a->{level} == 0) {
     return 1;
-  } elsif ($b->{title} eq '_found' && $b->{level} == 0) {
+  } elsif ($b->{title} eq $FOUND_DIR && $b->{level} == 0) {
     return -1;
   # Backup at level=0 is a special case (KeePassX's Backup group).
   } elsif ($a->{title} eq 'Backup' && $a->{level} == 0) {
@@ -581,7 +583,7 @@ sub cli_find($) {
 
   # Search entries by title, skipping the KeePassX /Backup group if it exists
   my $search_params = { 'title =~' => $search_str };
-  my $backup_dir_normalized=normalize_path_string("Backup"); # /Backup
+  my $backup_dir_normalized=normalize_path_string("/Backup"); # /Backup
   if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
     $search_params->{'group_id !'} =
 		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
@@ -594,7 +596,7 @@ sub cli_find($) {
   }
 
   # If we get this far we have results to add to a new /_found
-  my $found_group = $k->add_group({title => '_found'}); # root level group
+  my $found_group = $k->add_group({title => $FOUND_DIR}); # root level group
   my $found_gid = $found_group->{'id'};
   $k->unlock;
   my @matches=();
@@ -607,7 +609,7 @@ sub cli_find($) {
     # will not be saved to a file.
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
     $new_ent{path} = '/' . dirname(humanize_path($nulled_path)) . '/';
-    $new_ent{full_path} = humanize_path($nulled_path);
+    $new_ent{full_path} = '/' . humanize_path($nulled_path);
     $k->add_entry(\%new_ent);
     push(@matches, \%new_ent);
   }
@@ -617,7 +619,7 @@ sub cli_find($) {
   refresh_state_all_paths();
 
   # Tell the user what we found
-  print " - " . scalar(@matches) . " matches found and placed into /_found.\n";
+  print " - ".scalar(@matches)." matches found and placed into /$FOUND_DIR/\n";
 
   # If we only found one, ask the user if they want to see it
   if (scalar(@matches) == 1) {
@@ -625,7 +627,10 @@ sub cli_find($) {
     my $key=get_single_key();
     print "\n";
     if (lc($key) eq 'y') {
-      cli_show($self, { args => [ $matches[0]->{full_path} ] });
+      my $search_params = { 'group_id =' => $found_gid };
+      my ($e,@empty) = $k->find_entries($search_params);
+      my $full_path="/$FOUND_DIR/" . $e->{title};
+      cli_show($self, { args => [ $full_path ] });
     }
   }
 }
@@ -894,7 +899,7 @@ sub cli_show($$) {
   $state->{kdb}->unlock;
   print "\n";
   if (defined($ent->{path})) {
-    show_format("Path",$ent->{path}) . "\n";
+    print show_format("Path",$ent->{path}) . "\n";
   }
   print
 	show_format("Title",$ent->{title}) . "\n" .
@@ -1139,7 +1144,9 @@ sub cli_saveas($) {
 
   my $master_pass=GetMasterPasswd();
   print "Retype to verify: ";
+  ReadMode('noecho');
   my $checkval = ReadLine(0);
+  ReadMode('normal');
   chomp $checkval;
   print "\n";
   if ($master_pass ne $checkval) {
@@ -1157,7 +1164,7 @@ sub cli_saveas($) {
   if (! eval { $state->{kdb}->load_db($file, $master_pass) }) {
     die "Couldn't load the file $file: $@";
   }
-
+  $state->{kdb_has_changed}=0;
   $state->{kdb_file} = $file;
   $state->{put_master_passwd}($master_pass);
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -1280,6 +1287,13 @@ sub humanize_path($) {
 
 sub cli_open($) {
   my $path=shift @_;
+  our $state;
+
+  # If cli_close() does not return 0 the user decided not to close the file
+  if (cli_close() != 0) {
+    return -1;
+  }
+
   if ( -f $path ) {
     my $err = open_kdb($path);
     if (length($err)) {
@@ -1310,12 +1324,23 @@ sub cli_close {
     my $key=get_single_key();
     print "\n";
     if (lc($key) ne 'y') {
-      return;
+      return -1;
     }
   }
 
+  new_kdb($state);
+  return 0;
+}
+
+# This sets $state to a brand new, KeePassX-style, empty, unsaved database
+sub new_kdb($) {
+  my $state=shift @_;
   $state->{kdb_has_changed}=0;
   $state->{'kdb'} = File::KeePass->new;
+  # To be compatible with KeePassX
+  $state->{'kdb'}->add_group({ title => 'eMail' });
+  $state->{'kdb'}->add_group({ title => 'Internet' });
+  refresh_state_all_paths();
   if (-f $state->{placed_lock_file}) { unlink($state->{placed_lock_file}); }
   delete($state->{placed_lock_file});
   delete($state->{kdb_file});
@@ -1604,7 +1629,9 @@ sub encrypt_rijndael_cbc {
 sub put_master_passwd($) {
   my $master_pass = shift @_;
   our $state;
+  $state->{'master_pass_key'}='';
   $state->{'master_pass_key'} .= chr(int(255 * rand())) for 1..16;
+  $state->{'master_pass_enc_iv'}='';
   $state->{'master_pass_enc_iv'} .= chr(int(255 * rand())) for 1..16;
   $master_pass='CLEAR:' . $master_pass;
   $state->{'master_pass'}=encrypt_rijndael_cbc($master_pass,
@@ -1627,6 +1654,7 @@ sub warn_if_file_changed {
   our $state;
 
   my $file = $state->{kdb_file};
+  if (! length($file)) { return 0; } # If no file was opened, don't warn
   my $file_md5 = Digest::file::digest_file_hex($file, "MD5");
   if ($state->{kdb_file_md5} ne $file_md5) {
     my $bold="\e[1m";
@@ -1793,6 +1821,13 @@ This program may be distributed under the same terms as Perl itself.
                        removed between v0.86 and v0.9 and so I removed
                        kpli's call to it (Ctrl-r works for history).
                       Added the "icons" commands.
+ 2011-Sep-07 - v1.1 - Empty DBs are now initialized to KeePassX style.
+                      Fixed a couple of bugs in the find command.
+                      Fixed a password noecho bug in the saveas command.
+                      Fixed a kdb_has_changed bug in the saveas command.
+                      Fixed a cli_open bug where it wasn't cli_close'ing.
+                      Fixed variable init bugs in put_master_passwd().
+                      Fixed a false warning in warn_if_file_changed().
 
 =head1 TODO ITEMS
 
