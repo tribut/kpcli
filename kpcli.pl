@@ -16,6 +16,7 @@
 ###########################################################################
 
 use strict;                  # core
+use Clone;                   # core
 use FileHandle;              # core
 use Getopt::Long;            # core
 use File::Basename;          # core
@@ -36,7 +37,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.1";
+my $VERSION = "1.2";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -88,6 +89,29 @@ my $term = new Term::ShellUI(
              minargs => 1, maxargs => 1,
              args => \&Term::ShellUI::complete_files,
              proc => \&cli_saveas,
+         },
+         "export" => {
+             desc => "Export entries to a new KeePass DB (export <file.kdb>)",
+             doc => "\n" .
+		"Use this command to export the full tree of groups\n" .
+		"and entries to another KeePass database file on disk,\n" .
+		"starting at your current path (pwd).\n" .
+		"\n" .
+		"This is also a \"safer\" way to change your database\n" .
+		"password. Export from /, verify that the new file is\n" .
+		"good, and then remove your original file.\n",
+             minargs => 1, maxargs => 1,
+             args => \&Term::ShellUI::complete_files,
+             proc => \&cli_export,
+         },
+         "import" => {
+             desc => "Import another KeePass DB (import <file.kdb> <path>)",
+             doc => "\n" .
+		"Use this command to import the entire KeePass DB\n" .
+		"specified by <file.kdb> into a new group at <path>.\n",
+             minargs => 2, maxargs => 2,
+             args => [\&Term::ShellUI::complete_files,\&complete_groups],
+             proc => \&cli_import,
          },
          "open" => {
              desc => "Open a KeePass database file (open <file.kdb>)",
@@ -652,12 +676,18 @@ sub scrub_unknown_values_from_all_groups {
   our $state;
   my $k=$state->{kdb};
   my @all_groups_flattened = $k->find_groups({});
+  my @unkown_field_groups=();
   foreach my $g (@all_groups_flattened) {
     if (defined($g->{unknown})) {
-      warn "Deleting unknown fields from group $g->{title}\n";
       #warn "LHHD: " . &Dumper($g->{unknown}) . "\n";
       delete $g->{unknown};
+      push @unkown_field_groups, $g->{title};
     }
+  }
+  my $count = scalar(@unkown_field_groups);
+  if ($count > 0) {
+    warn "Deleted unknown fields from these $count groups: " .
+					join(", ", @unkown_field_groups) . "\n";
   }
 }
 
@@ -992,7 +1022,7 @@ sub get_entry_fields {
 	{ key=>'title', txt=>'Title' },
 	{ key=>'username', txt=>'Username' },
 	{ key=>'password', txt=>'Password',
-		hide_entry => 1, double_entry_verify => 1 },
+		hide_entry => 1, double_entry_verify => 1, genpasswd => 1 },
 	{ key=>'url', txt=>'URL' },
 	{ key=>'comment', txt=>'Notes/Comments' },
 	);
@@ -1099,6 +1129,9 @@ sub cli_new($) {
 
   my @fields = get_entry_fields();
   foreach my $input (@fields) {
+    if ($input->{genpasswd}) {
+      print " "x25 . '("g" to generate a password)' . "\r";
+    }
     print $input->{txt} . ": ";
     if ($input->{hide_entry}) {
       ReadMode(2); # Hide typing
@@ -1110,7 +1143,9 @@ sub cli_new($) {
     if ($input->{key} eq 'title' && length($val) == 0) {
       return;
     }
-    if ($input->{double_entry_verify}) {
+    if ($input->{genpasswd} && $val eq 'g') {
+      $val=generatePassword(20);
+    } elsif ($input->{double_entry_verify}) {
       print "Retype to verify: ";
       my $checkval = ReadLine(0);
       if ($input->{hide_entry}) { print "\n"; }
@@ -1136,6 +1171,166 @@ sub cli_new($) {
     print "Failed to add new entry.\n";
   }
   return 0;
+}
+
+sub cli_import($$) {
+  my $file=shift @_;
+  my $new_group=shift @_;
+  our $state;
+
+  # If the user gave us a bogus file there's nothing to do
+  if (! -f ($file)) {
+    print "File does not exist: $file\n";
+    return -1;
+  }
+  # If the $new_group path is relative, make it absolute
+  if ($new_group !~ m/^\//) {
+    $new_group = get_pwd() . "/$new_group";
+  }
+  # We won't import into an existing group
+  my $full_path=normalize_path_string($new_group);
+  if (defined($state->{all_grp_paths_fwd}->{$full_path})) {
+    print "You must specify a _new_ group to import into.\n";
+    return -1;
+  }
+  # Make sure the new group's parent exists
+  my ($grp_path,$grp_name)=normalize_and_split_raw_path($new_group);
+  if ($grp_path != '' && ! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
+    print "Path does not exist: /" . humanize_path($grp_path) . "\n";
+    return -1;
+  }
+  # Set the $parent_group value appropriately
+  my $parent_group = undef; # Root by default
+  if (length($grp_path)) {
+    $parent_group = $state->{all_grp_paths_fwd}->{$grp_path};
+  }
+  # Ask the user for the master password and then open the kdb
+  my $master_pass=GetMasterPasswd();
+  my $iKDB = File::KeePass->new;
+  if (! eval { $iKDB->load_db($file, $master_pass) }) {
+    print "Couldn't load the file $file: $@\n";
+    return -1;
+  }
+  # Add the new group, to its parent or to root if $parent_group==undef
+  my $k=$state->{kdb};
+  my $new_group=$k->add_group({
+	title => $grp_name,
+	group => $parent_group,
+	});
+  # Copy the $iKDB into our $k at $new_group
+  $iKDB->unlock();
+  $k->unlock();
+  my @root_groups = $iKDB->find_groups({level=>0});
+  foreach my $i_root_grp (@root_groups) {
+    copy_kdb_group_tree($k,$i_root_grp,$new_group);
+  }
+  $k->lock();
+  $iKDB->lock();
+  $iKDB=undef;
+  # Refresh all paths and mark state as changed
+  refresh_state_all_paths();
+  $state->{kdb_has_changed}=1;
+  RequestSaveOnDBChange();
+}
+
+sub cli_export($) {
+  my $file=shift @_;
+  our $state;
+
+  # Warn is we are being asked to overwrite a file
+  if (-e $file) {
+    print "WARNING: $file already exists.\n" .
+		"Overwrite it? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+  }
+
+  # Get the master password for the exported file
+  my $master_pass=GetMasterPasswd();
+  print "Retype to verify: ";
+  ReadMode('noecho');
+  my $checkval = ReadLine(0);
+  ReadMode('normal');
+  chomp $checkval;
+  print "\n";
+  if ($master_pass ne $checkval) {
+    print "Passwords did not match...\n";
+    return;
+  }
+
+  # Build the new kdb in RAM
+  my $k=$state->{kdb};
+  my $new_kdb=new File::KeePass;
+  $k->unlock; # Required so that we can copy the passwords
+  if (get_pwd() ne '/') {
+    # Grab the root group's $id at our pwd
+    my $pwd_group_id=$state->{path}->{id};
+    my ($root_grp,@trash) = $k->find_groups({id=>$pwd_group_id});
+    copy_kdb_group_tree($new_kdb,$root_grp,undef);
+  } else {
+    # Put all of the root groups into the new file (entire file copy)
+    my @root_groups = $k->find_groups({level=>0});
+    foreach my $root_grp (@root_groups) {
+      copy_kdb_group_tree($new_kdb,$root_grp,undef);
+    }
+  }
+  $k->lock;
+  $new_kdb->unlock;
+  my $new_db_bin = $new_kdb->gen_db($master_pass);
+  $new_kdb->lock;
+
+  # Test parsing the kdb from RAM (we'll most likely die if this fails)
+  my $new_db=new File::KeePass;
+  $new_db->parse_db($new_db_bin,$master_pass);
+
+  # Now write the new kdb to disk
+  my $fh=new FileHandle;
+  if (open($fh,'>',$file)) {
+    print $fh $new_db_bin;
+    close $fh;
+    print "Exported to $file\n";
+  } else {
+    print "Could not open \"$file\" for writing.\n";
+  }
+
+  return 0;
+}
+
+# A helper function for cli_export() and cli_import(). It takes a kdb object,
+# a group as a starting point to copy from, and optionally a parent_group to
+# copy to. It copies everything from the source group's root downward. In our
+# use cases, the _target_ $kdb object passed in here is typically a different
+# one than the _source_ $group is from.
+sub copy_kdb_group_tree($$$) {
+  my $kdb=shift @_;
+  my $group=shift @_;
+  my $parent_group=shift @_ || undef; # When undef, it writes to the root
+
+  # Add the new group, to it's parent or root if $parent_group==undef
+  my $new_group=$kdb->add_group({
+	title => $group->{title},
+	icon => $group->{icon},
+	id => $group->{id},
+	group => $parent_group,
+	});
+
+  # Add the new_group's entries
+  if (ref($group->{entries}) eq 'ARRAY') {
+    foreach my $entry (@{$group->{entries}}) {
+      $entry->{group} = $new_group;
+      $kdb->add_entry($entry);
+    }
+  }
+
+  # Add the new_group's child groups
+  if (ref($group->{groups}) eq 'ARRAY') {
+    foreach my $child_grp (@{$group->{groups}}) {
+      copy_kdb_group_tree($kdb,$child_grp,$new_group);
+    }
+  }
 }
 
 sub cli_saveas($) {
@@ -1216,14 +1411,26 @@ sub cli_rmdir($) {
   my $group_id = $state->{all_grp_paths_fwd}->{$grp_path};
   my $group = $state->{kdb}->find_group({ id => $group_id });
   my $entry_cnt=0;
-  if (defined($group->{entries})) { $entry_cnt=scalar(@{$group->{entries}}); }
-  my $group_cnt=0;
-  if (defined($group->{groups})) { $group_cnt=scalar(@{$group->{groups}}); }
-  if ( ($entry_cnt + $group_cnt) == 0) {
-    my $deleted_group = $state->{kdb}->delete_group({ id => $group_id });
-  } else {
-    print "First remove its $entry_cnt entries and $group_cnt sub-groups.\n";
+  if (defined($group->{entries})) {
+    $entry_cnt=
+	scalar(grep(m/^$grp_path\0/,keys %{$state->{all_ent_paths_fwd}}));
   }
+  my $group_cnt=0;
+  if (defined($group->{entries})) {
+    $group_cnt=
+	scalar(grep(m/^$grp_path\0/,keys %{$state->{all_grp_paths_fwd}}));
+  }
+  my $child_cnt=$entry_cnt + $group_cnt;
+  if ( $child_cnt > 0) {
+    print "WARNING: This group has $child_cnt child groups and/or entries.\n" .
+	"Really remove it!? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+  }
+  my $deleted_group = $state->{kdb}->delete_group({ id => $group_id });
 
   # Because we removed a group we need to refresh our state paths
   refresh_state_all_paths();
@@ -1678,6 +1885,25 @@ sub warn_if_file_changed {
   return 0;
 }
 
+sub generatePassword {
+   my $length = shift;
+   my @normal_chars=('a'..'z','A'..'Z',0..9);
+   my @special_chars=qw(_);
+   my $charset = join('', (@normal_chars,@special_chars));
+   # Generate the password
+   my $password = '';
+   while (length($password) < $length) {
+     $password .= substr($charset, (int(rand(length($charset)))), 1);
+   }
+   # Make sure that at least one special character appears
+   my $sccc=join('', @special_chars);
+   if ($password !~ m/[\Q$sccc\E]/) {
+     my $sc=$special_chars[int(rand(length($sccc)))];
+     substr($password,int(rand(length($password))), 1, $sc);
+   }
+   return $password
+}
+
 ########################################################################
 # Unix-style, "touch" a file
 ########################################################################
@@ -1820,7 +2046,7 @@ This program may be distributed under the same terms as Perl itself.
                       Term::ShellUI's complete_history() method was
                        removed between v0.86 and v0.9 and so I removed
                        kpli's call to it (Ctrl-r works for history).
-                      Added the "icons" commands.
+                      Added the "icons" command.
  2011-Sep-07 - v1.1 - Empty DBs are now initialized to KeePassX style.
                       Fixed a couple of bugs in the find command.
                       Fixed a password noecho bug in the saveas command.
@@ -1828,6 +2054,10 @@ This program may be distributed under the same terms as Perl itself.
                       Fixed a cli_open bug where it wasn't cli_close'ing.
                       Fixed variable init bugs in put_master_passwd().
                       Fixed a false warning in warn_if_file_changed().
+ 2011-Sep-30 - v1.2 - Added the "export" command.
+                      Added the "import" command.
+                      Command "rmdir" asks then deletes non-empty groups.
+                      Command "new" can auto-generate random passwords.
 
 =head1 TODO ITEMS
 
