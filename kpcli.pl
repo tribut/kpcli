@@ -37,7 +37,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.2";
+my $VERSION = "1.3";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -71,7 +71,7 @@ my $term = new Term::ShellUI(
 		"listed in preparation to run the show command.\n",
              maxargs => 1,
              args => \&complete_groups,
-             method => sub { if(cli_cd(@_) == 0) { cli_ls(@_) } },
+             method => sub { if(cli_cd(@_) == 0) { cli_ls() } },
          },
          "cd" => {
              desc => "Change directory (path to a group)",
@@ -2033,7 +2033,7 @@ This program may be distributed under the same terms as Perl itself.
                        back into place after realizing that v0.03 of
                       File::KeePass did not resolve all of the problems.
  2011-Apr-23 - v1.0 - Changed a perl 5.10+ regex to a backward-compatable
-                       one to resolve SourceForge bug # 3192413.
+                       one to resolve SourceForge bug number 3192413.
                       Modified the way that the /Backup group is ignored
                        by the find command to stop kpcli from croaking on
                        multiple entries with the same name in that group.
@@ -2058,6 +2058,8 @@ This program may be distributed under the same terms as Perl itself.
                       Added the "import" command.
                       Command "rmdir" asks then deletes non-empty groups.
                       Command "new" can auto-generate random passwords.
+ 2012-Mar-03 - v1.3 - Fixed bug in cl command as reported in SourceForge
+                       bug number 3496544.
 
 =head1 TODO ITEMS
 
