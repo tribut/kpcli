@@ -21,6 +21,7 @@ use FileHandle;              # core
 use Getopt::Long;            # core
 use File::Basename;          # core
 use Digest::file;            # core
+use Digest::SHA qw(sha256);  # core
 use Data::Dumper qw(Dumper); # core
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
@@ -37,7 +38,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.3";
+my $VERSION = "1.4";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -58,7 +59,8 @@ my $term = new Term::ShellUI(
          "help" => {
              desc => "Print helpful information",
              args => sub { shift->help_args(undef, @_); },
-             method => sub { shift->help_call(undef, @_); }
+             method => sub { my_help_call(shift); }
+             #method => sub { shift->help_call(undef, @_); }
          },
          "h" => { alias => "help", exclude_from_completion=>1},
          "?" => { alias => "help", exclude_from_completion=>1},
@@ -85,13 +87,16 @@ my $term = new Term::ShellUI(
          },
          "chdir" => { alias => 'cd' },
          "saveas" => {
-             desc => "Save to a specific filename (saveas <file.kdb>)",
-             minargs => 1, maxargs => 1,
-             args => \&Term::ShellUI::complete_files,
+             desc => "Save to a specific filename " .
+				"(saveas <file.kdb> [<file.key>])",
+             minargs => 1, maxargs => 2,
+             args => [\&Term::ShellUI::complete_files,
+					\&Term::ShellUI::complete_files],
              proc => \&cli_saveas,
          },
          "export" => {
-             desc => "Export entries to a new KeePass DB (export <file.kdb>)",
+             desc => "Export entries to a new KeePass DB " .
+				"(export <file.kdb> [<file.key>])",
              doc => "\n" .
 		"Use this command to export the full tree of groups\n" .
 		"and entries to another KeePass database file on disk,\n" .
@@ -100,23 +105,28 @@ my $term = new Term::ShellUI(
 		"This is also a \"safer\" way to change your database\n" .
 		"password. Export from /, verify that the new file is\n" .
 		"good, and then remove your original file.\n",
-             minargs => 1, maxargs => 1,
-             args => \&Term::ShellUI::complete_files,
+             minargs => 1, maxargs => 2,
+             args => [\&Term::ShellUI::complete_files,
+					\&Term::ShellUI::complete_files],
              proc => \&cli_export,
          },
          "import" => {
-             desc => "Import another KeePass DB (import <file.kdb> <path>)",
+             desc => "Import another KeePass DB " .
+				"(import <file.kdb> <path> [<file.key>])",
              doc => "\n" .
 		"Use this command to import the entire KeePass DB\n" .
 		"specified by <file.kdb> into a new group at <path>.\n",
-             minargs => 2, maxargs => 2,
-             args => [\&Term::ShellUI::complete_files,\&complete_groups],
+             minargs => 2, maxargs => 3,
+             args => [\&Term::ShellUI::complete_files,\&complete_groups,
+					\&Term::ShellUI::complete_files],
              proc => \&cli_import,
          },
          "open" => {
-             desc => "Open a KeePass database file (open <file.kdb>)",
-             minargs => 1, maxargs => 1,
-             args => \&Term::ShellUI::complete_files,
+             desc => "Open a KeePass database file " .
+				"(open <file.kdb> [<file.key>])",
+             minargs => 1, maxargs => 2,
+             args => [\&Term::ShellUI::complete_files,
+					\&Term::ShellUI::complete_files],
              proc => \&cli_open,
          },
          "mkdir" => {
@@ -228,7 +238,7 @@ our $state={
 	};
 # If given --kdb=, open that file
 if (length($opts->{kdb})) {
-  my $err = open_kdb($opts->{kdb}); # Sets $state->{'kdb'}
+  my $err = open_kdb($opts->{kdb}, $opts->{key}); # Sets $state->{'kdb'}
   if (length($err)) {
     print "Error opening file: $err\n";
   }
@@ -262,8 +272,9 @@ exit;
 ############################################################################
 ############################################################################
 
-sub open_kdb($) {
+sub open_kdb($$) {
   my $file=shift @_;
+  my $key_file=shift @_;
   our $state;
 
   # Make sure the file exists and is readable
@@ -296,7 +307,8 @@ sub open_kdb($) {
   # Ask the user for the master password and then open the kdb
   my $master_pass=GetMasterPasswd();
   $state->{kdb} = File::KeePass->new;
-  if (! eval { $state->{kdb}->load_db($file, $master_pass) }) {
+  if (! eval { $state->{kdb}->load_db($file,
+			composite_master_pass($master_pass, $key_file)) }) {
     die "Couldn't load the file $file: $@";
   }
 
@@ -305,6 +317,7 @@ sub open_kdb($) {
   }
 
   $state->{kdb_file} = $file;
+  $state->{key_file} = $key_file;
   $state->{put_master_passwd}($master_pass);
   $state->{kdb_has_changed}=0;
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -735,7 +748,8 @@ sub cli_save($) {
   scrub_unknown_values_from_all_groups(); # TODO - remove later
   my $k=$state->{kdb};
   $k->unlock;
-  my $master_pass=$state->{get_master_passwd}();
+  my $master_pass=
+	composite_master_pass($state->{get_master_passwd}(),$state->{key_file});
   $k->save_db($state->{kdb_file},$master_pass);
   $state->{kdb_has_changed}=0; # set our state to no change since last save
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -1176,6 +1190,7 @@ sub cli_new($) {
 sub cli_import($$) {
   my $file=shift @_;
   my $new_group=shift @_;
+  my $key_file=shift @_;
   our $state;
 
   # If the user gave us a bogus file there's nothing to do
@@ -1207,7 +1222,8 @@ sub cli_import($$) {
   # Ask the user for the master password and then open the kdb
   my $master_pass=GetMasterPasswd();
   my $iKDB = File::KeePass->new;
-  if (! eval { $iKDB->load_db($file, $master_pass) }) {
+  if (! eval { $iKDB->load_db($file,
+			composite_master_pass($master_pass, $key_file)) }) {
     print "Couldn't load the file $file: $@\n";
     return -1;
   }
@@ -1233,8 +1249,9 @@ sub cli_import($$) {
   RequestSaveOnDBChange();
 }
 
-sub cli_export($) {
+sub cli_export($$) {
   my $file=shift @_;
+  my $key_file=shift @_;
   our $state;
 
   # Warn is we are being asked to overwrite a file
@@ -1250,6 +1267,10 @@ sub cli_export($) {
 
   # Get the master password for the exported file
   my $master_pass=GetMasterPasswd();
+  if (length($master_pass) == 0) {
+    print "For your safety, empty passwords are not allowed...\n";
+    return;
+  }
   print "Retype to verify: ";
   ReadMode('noecho');
   my $checkval = ReadLine(0);
@@ -1279,12 +1300,13 @@ sub cli_export($) {
   }
   $k->lock;
   $new_kdb->unlock;
-  my $new_db_bin = $new_kdb->gen_db($master_pass);
+  my $new_db_bin =
+		$new_kdb->gen_db(composite_master_pass($master_pass,$key_file));
   $new_kdb->lock;
 
   # Test parsing the kdb from RAM (we'll most likely die if this fails)
   my $new_db=new File::KeePass;
-  $new_db->parse_db($new_db_bin,$master_pass);
+  $new_db->parse_db($new_db_bin,composite_master_pass($master_pass,$key_file));
 
   # Now write the new kdb to disk
   my $fh=new FileHandle;
@@ -1335,6 +1357,7 @@ sub copy_kdb_group_tree($$$) {
 
 sub cli_saveas($) {
   my $file=shift @_;
+  my $key_file=shift @_;
   our $state;
 
   my $master_pass=GetMasterPasswd();
@@ -1352,15 +1375,17 @@ sub cli_saveas($) {
   destroy_found();
   scrub_unknown_values_from_all_groups(); # TODO - remove later
   $state->{kdb}->unlock;
-  $state->{kdb}->save_db($file,$master_pass);
+  $state->{kdb}->save_db($file,composite_master_pass($master_pass,$key_file));
   $state->{kdb}->lock;
 
   $state->{kdb}= File::KeePass->new;
-  if (! eval { $state->{kdb}->load_db($file, $master_pass) }) {
+  if (! eval { $state->{kdb}->load_db($file,
+			composite_master_pass($master_pass,$key_file)) }) {
     die "Couldn't load the file $file: $@";
   }
   $state->{kdb_has_changed}=0;
   $state->{kdb_file} = $file;
+  $state->{key_file} = $key_file;
   $state->{put_master_passwd}($master_pass);
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
   return 0;
@@ -1494,6 +1519,7 @@ sub humanize_path($) {
 
 sub cli_open($) {
   my $path=shift @_;
+  my $key=shift @_;
   our $state;
 
   # If cli_close() does not return 0 the user decided not to close the file
@@ -1502,7 +1528,7 @@ sub cli_open($) {
   }
 
   if ( -f $path ) {
-    my $err = open_kdb($path);
+    my $err = open_kdb($path, $key);
     if (length($err)) {
       print "Error opening file: $err\n";
     }
@@ -1551,6 +1577,7 @@ sub new_kdb($) {
   if (-f $state->{placed_lock_file}) { unlink($state->{placed_lock_file}); }
   delete($state->{placed_lock_file});
   delete($state->{kdb_file});
+  delete($state->{key_file});
   delete($state->{master_pass});
   cli_cd($term, {'args' => ["/"]});
 }
@@ -1689,7 +1716,7 @@ sub GetMasterPasswd {
 
 sub MyGetOpts {
   my %opts=();
-  my $result = &GetOptions(\%opts, "kdb=s", "help", "h");
+  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "help", "h");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -1702,6 +1729,10 @@ sub MyGetOpts {
     push @errs, "for option --kdb=<file.kbd>, the file must exist.";
   }
 
+  if ((length($opts{key}) && (! -e $opts{key}))) {
+    push @errs, "for option --key=<file.key>, the file must exist.";
+  }
+
   if (scalar(@errs)) {
     warn "There were errors:\n" .
 	"  " . join("\n  ", @errs) . "\n\n";
@@ -1712,15 +1743,27 @@ sub MyGetOpts {
 }
 
 sub GetUsageMessage {
-  my $t="Usage: $APP_NAME [--kdb=<file.kdb>]\n" .
+  my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
   "\n" .
   "    --help\tThis message.\n" .
   "    --kdb\tOptional KeePass 1.x database file to open (must exist)\n" .
+  "    --key\tOptional KeePass 1.x key file (must exist)\n" .
   "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
   "about kpcli's commands.\n";
   "\n";
   return $t;
+}
+
+# Because Term::ShellUI has a fixed width (%20s) for the command length
+# and we don't need nearly that much, we had to implement our own help
+# function instead of using the built-in help_call() method.
+sub my_help_call($) {
+  my $term = shift @_;
+  my $help = $term->get_all_cmd_summaries($term->commands());
+  $help =~ s/^ {12}//gm; # Trim some leading spaces off of each line of output
+  print $help;
+  return 0;
 }
 
 ########################################################################
@@ -1833,6 +1876,33 @@ sub encrypt_rijndael_cbc {
     $buffer .= chr($extra) for 1 .. $extra;
     return $cipher->encrypt($buffer);
 }
+sub composite_master_pass($$) {
+  my ($pass, $key_file) = @_;
+
+  # composite password in case of key file
+  if (defined $key_file and length($key_file) and -f $key_file) {
+    open(my $fh,'<',$key_file) || die "Couldn't open key file $key_file: $!\n";
+    my $size = -s $key_file;
+    read($fh, my $buffer, $size);
+    close $fh;
+    if (length($buffer) != $size) {
+      die "Couldn't read entire key file contents of $key_file.\n";
+    }
+
+    $pass = substr(sha256($pass),0,32);
+    if ($size == 32) {
+      $pass .= $buffer;
+    } elsif ($size == 64) {
+      for (my $i = 0; $i < 64; $i += 2) {
+        $pass .= chr(hex(substr($buffer,$i,2)));
+      }
+    } else {
+      $pass .= substr(sha256($buffer),0,32);
+    }
+  }
+
+  return $pass;
+}
 sub put_master_passwd($) {
   my $master_pass = shift @_;
   our $state;
@@ -1845,7 +1915,7 @@ sub put_master_passwd($) {
 		$state->{'master_pass_key'}, $state->{'master_pass_enc_iv'});
   return 0;
 }
-sub get_master_passwd($) {
+sub get_master_passwd() {
   our $state;
   my $master_pass=decrypt_rijndael_cbc($state->{master_pass},
 		$state->{'master_pass_key'}, $state->{'master_pass_enc_iv'});
@@ -1938,6 +2008,10 @@ database files (http://http://en.wikipedia.org/wiki/KeePass).  This
 program was inspired by my use of "kedpm -c" combined with my need
 to migrate to KeePass. The curious can read about the Ked Password
 Manager at http://http://kedpm.sourceforge.net/.
+
+=head1 USAGE
+
+Please run the program and type "help" to learn how to use it.
 
 =head1 PREREQUISITES
 
@@ -2060,6 +2134,11 @@ This program may be distributed under the same terms as Perl itself.
                       Command "new" can auto-generate random passwords.
  2012-Mar-03 - v1.3 - Fixed bug in cl command as reported in SourceForge
                        bug number 3496544.
+ 2012-Apr-17 - v1.4 - Added key file support based on a user contributed
+                       patch with SourceForge ID# 3518388.
+                      Added my_help_call() to allow for longer and more
+                       descriptive command summaries (for help command).
+                      Stopped allowing empty passwords for export.
 
 =head1 TODO ITEMS
 
