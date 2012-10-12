@@ -4,7 +4,7 @@
 #
 # kpcli - KeePass Command Line Interface
 #
-# Author: Lester Hightower <hightowe _over_at_ cpan.org>
+# Author: Lester Hightower <hightowe at cpan dot org>
 #
 # This program was inspired by "kedpm -c" and resulted despite illness
 # (or more likely because of it) over the USA Thanksgiving holiday in
@@ -16,6 +16,7 @@
 ###########################################################################
 
 use strict;                  # core
+use version;                 # core
 use Clone;                   # core
 use FileHandle;              # core
 use Getopt::Long;            # core
@@ -38,7 +39,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.4";
+my $VERSION = "1.5";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -55,15 +56,19 @@ my $term = new Term::ShellUI(
             "-d NUM to delete a single item\n",
             args => "[-c] [-d] [number]",
             method => sub { shift->history_call(@_) },
+	    exclude_from_history => 1,
          },
          "help" => {
              desc => "Print helpful information",
              args => sub { shift->help_args(undef, @_); },
-             method => sub { my_help_call(shift); }
+             method => sub { my_help_call(@_); },
+	     exclude_from_history => 1,
              #method => sub { shift->help_call(undef, @_); }
          },
-         "h" => { alias => "help", exclude_from_completion=>1},
-         "?" => { alias => "help", exclude_from_completion=>1},
+         "h" => { alias => "help",
+		exclude_from_completion=>1, exclude_from_history => 1,},
+         "?" => { alias => "help",
+		exclude_from_completion=>1, exclude_from_history => 1,},
          "cl" => {
              desc => "Change directory and list entries (cd+ls)",
              doc => "\n" .
@@ -75,6 +80,15 @@ my $term = new Term::ShellUI(
              args => \&complete_groups,
              method => sub { if(cli_cd(@_) == 0) { cli_ls() } },
          },
+	 "cls" => {
+	     desc => 'Clear screen ("clear" command also works)',
+	     doc  => "\n" .
+		"Clear the screen, which is useful when guests arrive.\n",
+	     maxargs => 0,
+	     method => sub { print "\033[2J\033[0;0H"; },
+	     exclude_from_history => 1,
+	 },
+         "clear" => { alias => "cls", exclude_from_history => 1, },
          "cd" => {
              desc => "Change directory (path to a group)",
              doc => "\n" .
@@ -221,8 +235,9 @@ my $term = new Term::ShellUI(
          "quit" => {
              desc => "Quit this program (EOF and exit also work)",
              maxargs => 0, method => \&cli_quit,
+	     exclude_from_history => 1,
          },
-         "exit" => { alias => "quit", exclude_from_completion=>1},
+         "exit" => { alias => "quit", exclude_from_history => 1,}
        },
     );
 $term->prompt(\&term_set_prompt);
@@ -674,7 +689,7 @@ sub cli_find($) {
 
 # Something is going wrong between KeePassX and File::KeePass related to
 # the unknown values read/written by File::KeePass from/to files written
-# by KeePassX. Commenting out like 378 of File/KeePass.pm is one fix,
+# by KeePassX. Commenting out line 378 of File/KeePass.pm is one fix,
 # this prevents me from needing to do that by just removing the unknown
 # values before saving. If there is a downside to this on the KeePassX
 # side I've not found it yet. I do have an email out to Paul, the author
@@ -687,6 +702,10 @@ sub cli_find($) {
 #       Sourceforge bug# 3187054 demonstrated the problem as well.
 sub scrub_unknown_values_from_all_groups {
   our $state;
+  # No need to do this with newer versions of File::KeePass (fixed in 2.01)
+  if (version->parse($File::KeePass::VERSION) >= version->parse('2.03')) {
+    return;
+  }
   my $k=$state->{kdb};
   my @all_groups_flattened = $k->find_groups({});
   my @unkown_field_groups=();
@@ -711,6 +730,14 @@ sub cli_save($) {
   if (! length($state->{kdb_file})) {
     print "Please use the saveas command for new files.\n";
     return;
+  }
+
+  # If the user has asked for a *.kdbx file, check the File::KeePass version
+  if (version->parse($File::KeePass::VERSION) < version->parse('2.03')) {
+    if ($state->{kdb_file} =~ m/\.kdbx$/i) {
+      print "KeePass v2 (*.kdbx files) require File::KeePass >= v2.03\n";
+      return;
+    }
   }
 
   if (warn_if_file_changed()) {
@@ -983,13 +1010,18 @@ sub cli_edit($) {
     } else {
       print $input->{txt} . " (\"".$ent->{$input->{key}}."\"): ";
     }
+    if ($input->{genpasswd}) {
+      print " "x25 . '("g" to generate a password)' . "\r";
+    }
     if ($input->{hide_entry}) {
       ReadMode(2); # Hide typing
     }
     my $val = ReadLine(0);
     if ($input->{hide_entry}) { print "\n"; }
     chomp $val;
-    if (length($val) && $input->{double_entry_verify}) {
+    if ($input->{genpasswd} && $val eq 'g') {
+      $val=generatePassword(20);
+    } elsif (length($val) && $input->{double_entry_verify}) {
       print "Retype to verify: ";
       my $checkval = ReadLine(0);
       if ($input->{hide_entry}) { print "\n"; }
@@ -1359,6 +1391,14 @@ sub cli_saveas($) {
   my $file=shift @_;
   my $key_file=shift @_;
   our $state;
+
+  # If the user has asked for a *.kdbx file, check the File::KeePass version
+  if (version->parse($File::KeePass::VERSION) < version->parse('2.03')) {
+    if ($file =~ m/\.kdbx$/i) {
+      print "KeePass v2 (*.kdbx files) require File::KeePass >= v2.03\n";
+      return;
+    }
+  }
 
   my $master_pass=GetMasterPasswd();
   print "Retype to verify: ";
@@ -1760,6 +1800,13 @@ sub GetUsageMessage {
 # function instead of using the built-in help_call() method.
 sub my_help_call($) {
   my $term = shift @_;
+  # @_ now holds: [Term::ShellUI->{commands}, <optional: specific command>]
+  # If the user is asking for detailed help on a specific command, do that
+  if (scalar(@_) > 1) {
+    $term->help_call(undef, @_);
+    return;
+  }
+  # If no specific command was requested, show the command summaries
   my $help = $term->get_all_cmd_summaries($term->commands());
   $help =~ s/^ {12}//gm; # Trim some leading spaces off of each line of output
   print $help;
@@ -2079,6 +2126,12 @@ Lester Hightower <hightowe at cpan dot org>
 
 This program may be distributed under the same terms as Perl itself.
 
+=head1 CREDITS
+
+Special thanks to Paul Seamons, author of File::KeePass, and to
+Scott Bronson, author of Term::ShellUI. Without those two modules
+this work would never have been posible.
+
 =head1 CHANGELOG
 
  2010-Nov-28 - v0.1 - Initial release.
@@ -2139,6 +2192,14 @@ This program may be distributed under the same terms as Perl itself.
                       Added my_help_call() to allow for longer and more
                        descriptive command summaries (for help command).
                       Stopped allowing empty passwords for export.
+ 2012-Oct-13 - v1.5 - Fixed "help <foo>" commands, that I broke in v1.4.
+                      Command "edit" can auto-generate random passwords.
+                      Added the "cls" and "clear" commands from a patch
+                       with SourceForge ID# 3573930.
+                      Tested compatibility with File::KeePass v2.03 and
+                       made minor changes that are possible with >=2.01.
+                      With File::KeePass v2.03, kpcli should now support
+                       KeePass v2 files (*.kdbx).
 
 =head1 TODO ITEMS
 
