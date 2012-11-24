@@ -24,6 +24,7 @@ use File::Basename;          # core
 use Digest::file;            # core
 use Digest::SHA qw(sha256);  # core
 use Data::Dumper qw(Dumper); # core
+use Term::ANSIColor;         # core
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
 use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
@@ -39,7 +40,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.5";
+my $VERSION = "1.6";
 
 my $opts=MyGetOpts();  # Will only return with options we think we can use
 
@@ -173,7 +174,7 @@ my $term = new Term::ShellUI(
              method => \&cli_rm,
          },
          "show" => {
-             desc => "Show an entry: show <path to entry|entry number>",
+             desc => "Show an entry: show [-f] <path to entry|entry number>",
              doc => "\n" .
 		"The show command tries to intelligently determine\n" .
 		"what you want to see and to make it easy to display.\n" .
@@ -183,8 +184,12 @@ my $term = new Term::ShellUI(
 		"When using entry numbers, they will refer to the last\n" .
 		"path when an ls was performed or pwd if ls has not\n" .
 		"yet been run.\n" .
+		"\n" .
+		"By default, passwords are \"hidden\" by being displayed as\n" .
+		"\"red on red\" where they can be copied to the clip board\n" .
+		"but not seen. Provide the -f option to show passwords.\n" .
 		"",
-             minargs => 1, maxargs => 1,
+             minargs => 1, maxargs => 2,
              args => \&complete_groups_and_entries,
              method => \&cli_show,
          },
@@ -723,9 +728,21 @@ sub scrub_unknown_values_from_all_groups {
   }
 }
 
+sub deny_if_readonly {
+  our %opts;
+  if (defined($opts->{readonly}) && int($opts->{readonly})) {
+    print "Function not available with --readonly set.\n";
+    return 1;
+  }
+  return 0;
+}
+
 sub cli_save($) {
   my $self = shift @_;
   my $params = shift @_;
+
+  if (deny_if_readonly()) { return; }
+
   our $state;
   if (! length($state->{kdb_file})) {
     print "Please use the saveas command for new files.\n";
@@ -793,7 +810,7 @@ sub cli_rm($) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -869,7 +886,7 @@ sub cli_rename($$) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -905,7 +922,7 @@ sub cli_mv($$) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -956,26 +973,38 @@ sub cli_show($$) {
   my $params = shift @_;
   our $state;
 
-  my $target = $params->{args}->[0];
+  # Users can provide a -f option to show the password. We use GetOptions
+  # to parse this command line, and $target holds that target.
+  my $target='';
+  my %opts=();
+  {
+    local @ARGV = @{$params->{args}};
+    my $result = &GetOptions(\%opts, "f");
+    if (scalar(@ARGV) != 1) {
+      return -1;
+    }
+    $target = $ARGV[0];
+  }
+
   my $ent=find_target_entity_by_number_or_path($target);
   if (! defined($ent)) {
     return -1;
   }
-
-#  my $path='unknown';
-#  if (defined($state->{all_ent_paths_rev}->{$ent->{id}})) {
-#    $path=humanize_path($state->{all_ent_paths_rev}->{$ent->{id}});
-#  }
 
   $state->{kdb}->unlock;
   print "\n";
   if (defined($ent->{path})) {
     print show_format("Path",$ent->{path}) . "\n";
   }
+  # Unless -f is specified, we "hide" the password as red-on-red.
+  my $password = $ent->{password};
+  if (! defined($opts{f})) {
+    $password = colored(['red on_red'], $password);
+  }
   print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
-	show_format("Pass",$ent->{password}) . "\n" .
+	show_format("Pass",$password) . "\n" .
 	show_format("URL",$ent->{url}) . "\n" .
 	show_format("Icon#",$ent->{icon}) . "\n" .
 	show_format("Notes",$ent->{comment}) . "\n" .
@@ -990,7 +1019,7 @@ sub cli_edit($) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1008,7 +1037,9 @@ sub cli_edit($) {
     if ($input->{hide_entry}) {
       print $input->{txt} . ": ";
     } else {
-      print $input->{txt} . " (\"".$ent->{$input->{key}}."\"): ";
+      my $val = $ent->{$input->{key}};
+      if ($val =~ m/\r|\n/) { $val = "\n$val\n"; }
+      print $input->{txt} . " (\"".$val."\"): ";
     }
     if ($input->{genpasswd}) {
       print " "x25 . '("g" to generate a password)' . "\r";
@@ -1016,20 +1047,11 @@ sub cli_edit($) {
     if ($input->{hide_entry}) {
       ReadMode(2); # Hide typing
     }
-    my $val = ReadLine(0);
-    if ($input->{hide_entry}) { print "\n"; }
-    chomp $val;
-    if ($input->{genpasswd} && $val eq 'g') {
-      $val=generatePassword(20);
-    } elsif (length($val) && $input->{double_entry_verify}) {
-      print "Retype to verify: ";
-      my $checkval = ReadLine(0);
-      if ($input->{hide_entry}) { print "\n"; }
-      chomp $checkval;
-      if ($checkval ne $val) {
-        print "Entries mismatched. Please try again.\n";
-        redo;
-      }
+    my $val = '';
+    if ($input->{multiline}) {
+      $val = new_edit_multiline_input($input);
+    } else {
+      $val = new_edit_single_line_input($input);
     }
     # If the field was not empty, change it to the new $val
     if (length($val)) {
@@ -1051,6 +1073,50 @@ sub cli_edit($) {
 return 0;
 }
 
+# Single line input helper function for cli_new and cli_edit.
+sub new_edit_single_line_input($) {
+  my $input = shift @_;
+  my $val = ReadLine(0);
+  if ($input->{hide_entry}) { print "\n"; }
+  chomp $val;
+  if ($input->{genpasswd} && $val eq 'g') {
+    $val=generatePassword(20);
+  } elsif (length($val) && $input->{double_entry_verify}) {
+    print "Retype to verify: ";
+    my $checkval = ReadLine(0);
+    if ($input->{hide_entry}) { print "\n"; }
+    chomp $checkval;
+    if ($checkval ne $val) {
+      print "Entries mismatched. Please try again.\n";
+      redo;
+    }
+  }
+  return $val;
+}
+# Multi-line input helper function for cli_new and cli_edit.
+sub new_edit_multiline_input($) {
+  my $input = shift @_;
+
+  my $bold="\e[1m";
+  my $red="\e[31m";
+  my $yellow="\e[33m";
+  my $clear="\e[0m";
+  print "\n$yellow(end multi-line input with a single \".\" on a line)$clear\n";
+
+  my $val = ''; my $unfinished = 1;
+  while ($unfinished) {
+    my $line = ReadLine(0);
+    if ($line =~ m/^\.[\r\n]*$/) { # a lone "." ends our input
+      $unfinished = 0;
+    } else {
+      $val .= $line;
+      if ($val =~ m/^[\r\n]*$/) { $val = ''; $unfinished = 0; }
+    }
+  }
+  chomp($val); # Remove extra line at the end
+  return $val;
+}
+
 # Formats an entry for display for cli_show()
 sub show_format($$) {
   my $title=shift @_;
@@ -1070,7 +1136,7 @@ sub get_entry_fields {
 	{ key=>'password', txt=>'Password',
 		hide_entry => 1, double_entry_verify => 1, genpasswd => 1 },
 	{ key=>'url', txt=>'URL' },
-	{ key=>'comment', txt=>'Notes/Comments' },
+	{ key=>'comment', txt=>'Notes/Comments', 'multiline' => 1 },
 	);
   return @fields;
 }
@@ -1151,7 +1217,7 @@ sub cli_new($) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1182,24 +1248,15 @@ sub cli_new($) {
     if ($input->{hide_entry}) {
       ReadMode(2); # Hide typing
     }
-    my $val = ReadLine(0);
-    if ($input->{hide_entry}) { print "\n"; }
-    chomp $val;
+    my $val = '';
+    if ($input->{multiline}) {
+      $val = new_edit_multiline_input($input);
+    } else {
+      $val = new_edit_single_line_input($input);
+    }
     # If the user gave us an empty title, abort the new entry
     if ($input->{key} eq 'title' && length($val) == 0) {
       return;
-    }
-    if ($input->{genpasswd} && $val eq 'g') {
-      $val=generatePassword(20);
-    } elsif ($input->{double_entry_verify}) {
-      print "Retype to verify: ";
-      my $checkval = ReadLine(0);
-      if ($input->{hide_entry}) { print "\n"; }
-      chomp $checkval;
-      if ($checkval ne $val) {
-        print "Entries mismatched. Please try again.\n";
-        redo;
-      }
     }
     $new_entry->{$input->{key}} = $val;
     ReadMode(0); # Return to normal
@@ -1224,6 +1281,8 @@ sub cli_import($$) {
   my $new_group=shift @_;
   my $key_file=shift @_;
   our $state;
+
+  if (deny_if_readonly()) { return; }
 
   # If the user gave us a bogus file there's nothing to do
   if (! -f ($file)) {
@@ -1458,7 +1517,7 @@ sub cli_rmdir($) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1509,7 +1568,7 @@ sub cli_mkdir($) {
   my $params = shift @_;
   our $state;
 
-  if (warn_if_file_changed()) {
+  if (deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1756,7 +1815,7 @@ sub GetMasterPasswd {
 
 sub MyGetOpts {
   my %opts=();
-  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "help", "h");
+  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "help", "h", "readonly");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -1786,8 +1845,9 @@ sub GetUsageMessage {
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
   "\n" .
   "    --help\tThis message.\n" .
-  "    --kdb\tOptional KeePass 1.x database file to open (must exist)\n" .
-  "    --key\tOptional KeePass 1.x key file (must exist)\n" .
+  "    --kdb\tOptional KeePass database file to open (must exist)\n" .
+  "    --key\tOptional KeePass key file (must exist)\n" .
+  "    --readonly\tRun in read-only mode; no changes will be allowed.\n" .
   "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
   "about kpcli's commands.\n";
@@ -1810,6 +1870,8 @@ sub my_help_call($) {
   my $help = $term->get_all_cmd_summaries($term->commands());
   $help =~ s/^ {12}//gm; # Trim some leading spaces off of each line of output
   print $help;
+  print "\n" .
+	"Type \"help <command>\" for more detailed help on a command.\n";
   return 0;
 }
 
@@ -2045,12 +2107,12 @@ return($retval);
 
 =head1 NAME
 
-kpcli - A command line interface to KeePass 1.x database files.
+kpcli - A command line interface to KeePass database files.
 
 
 =head1 DESCRIPTION
 
-A command line interface (interactive shell) to work with KeePass 1.x
+A command line interface (interactive shell) to work with KeePass
 database files (http://http://en.wikipedia.org/wiki/KeePass).  This
 program was inspired by my use of "kedpm -c" combined with my need
 to migrate to KeePass. The curious can read about the Ked Password
@@ -2200,6 +2262,11 @@ this work would never have been posible.
                        made minor changes that are possible with >=2.01.
                       With File::KeePass v2.03, kpcli should now support
                        KeePass v2 files (*.kdbx).
+ 2012-Nov-25 - v1.6 - Hide passwords (red on red) in the show command
+                       unless the -f option is given.
+                      Added the --readonly command line option.
+                      Added support for multi-line notes/comments;
+                       input ends on a line holding a single ".".
 
 =head1 TODO ITEMS
 
