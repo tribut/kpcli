@@ -28,8 +28,10 @@ use Term::ANSIColor;         # core
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
 use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
-use Term::ShellUI;           # non-core, add Term::ReadLine::Gnu for cli history
-use File::KeePass 0.03;      # non-core, >=v0.03 needed due critical bug fixes
+use Term::ShellUI;           # non-core, libterm-shellui-perl on Ubuntu
+                             #  - add Term::ReadLine::Gnu for cli history
+use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
+                             #  - >=v0.03 needed due critical bug fixes
 $|=1;
 
 my $DEBUG=0;
@@ -40,14 +42,15 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $APP_NAME = basename($0);
 $APP_NAME =~ s/\.pl$//;
 
-my $VERSION = "1.6";
+my $VERSION = "1.7";
 
-my $opts=MyGetOpts();  # Will only return with options we think we can use
+our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
+my $opts=MyGetOpts();   # Will only return with options we think we can use
 
 # Setup our Term::ShellUI object
 my $term = new Term::ShellUI(
     app => $APP_NAME,
-    history_file => "~/.$APP_NAME-history",
+    history_file => $HISTORY_FILE,
     keep_quotes => 0,
     commands => {
          #"" => { args => sub { shift->complete_history(@_) } },
@@ -59,6 +62,13 @@ my $term = new Term::ShellUI(
             method => sub { shift->history_call(@_) },
 	    exclude_from_history => 1,
          },
+         "version" => {
+             desc => "Print the version of this program",
+             method => sub { print "$VERSION\n"; },
+	     exclude_from_history => 1,
+         },
+         "ver" => { alias => "version",
+		exclude_from_completion=>1, exclude_from_history => 1,},
          "help" => {
              desc => "Print helpful information",
              args => sub { shift->help_args(undef, @_); },
@@ -174,7 +184,7 @@ my $term = new Term::ShellUI(
              method => \&cli_rm,
          },
          "show" => {
-             desc => "Show an entry: show [-f] <path to entry|entry number>",
+             desc => "Show an entry: show [-f] [-a] <entry path|entry number>",
              doc => "\n" .
 		"The show command tries to intelligently determine\n" .
 		"what you want to see and to make it easy to display.\n" .
@@ -188,8 +198,10 @@ my $term = new Term::ShellUI(
 		"By default, passwords are \"hidden\" by being displayed as\n" .
 		"\"red on red\" where they can be copied to the clip board\n" .
 		"but not seen. Provide the -f option to show passwords.\n" .
+		"Use the -a option to see create and modified times, and\n" .
+		"the index of the icon set for the entry.\n" .
 		"",
-             minargs => 1, maxargs => 2,
+             minargs => 1, maxargs => 3,
              args => \&complete_groups_and_entries,
              method => \&cli_show,
          },
@@ -979,7 +991,7 @@ sub cli_show($$) {
   my %opts=();
   {
     local @ARGV = @{$params->{args}};
-    my $result = &GetOptions(\%opts, "f");
+    my $result = &GetOptions(\%opts, 'f', 'a');
     if (scalar(@ARGV) != 1) {
       return -1;
     }
@@ -1006,10 +1018,15 @@ sub cli_show($$) {
 	show_format("Uname",$ent->{username}) . "\n" .
 	show_format("Pass",$password) . "\n" .
 	show_format("URL",$ent->{url}) . "\n" .
-	show_format("Icon#",$ent->{icon}) . "\n" .
 	show_format("Notes",$ent->{comment}) . "\n" .
-	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '') .
-	"\n";
+	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '');
+  if (defined($opts{a})) {
+    print
+	show_format("Icon#",$ent->{icon}) . "\n" .
+	show_format("Creat",$ent->{created}) . "\n" .
+	show_format("Modif",$ent->{modified}) . "\n";
+  }
+  print "\n";
   print &Dumper($ent) . "\n" if ($DEBUG > 2);
   $state->{kdb}->lock;
 }
@@ -1063,8 +1080,11 @@ sub cli_edit($) {
     ReadMode(0); # Return to normal
   }
 
-  # If the use made changes, prompt them to save
+  # If the use made changes, update modify time and prompt them to save
   if ($had_changes) {
+    $state->{kdb}->unlock;
+    $ent->{modified} = $state->{kdb}->now;
+    $state->{kdb}->lock;
     refresh_state_all_paths();
     $state->{kdb_has_changed}=1;
     RequestSaveOnDBChange();
@@ -1815,12 +1835,20 @@ sub GetMasterPasswd {
 
 sub MyGetOpts {
   my %opts=();
-  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "help", "h", "readonly");
+  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "histfile=s",
+						"help", "h", "readonly");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
     print GetUsageMessage();
     exit;
+  }
+
+  # Allow the user to override the history file
+  if (defined($opts{histfile}) && length($opts{histfile})) {
+    our $HISTORY_FILE = $opts{histfile};
+  } else {
+    our $HISTORY_FILE = "~/.$APP_NAME-history";
   }
 
   my @errs=();
@@ -1845,8 +1873,9 @@ sub GetUsageMessage {
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
   "\n" .
   "    --help\tThis message.\n" .
-  "    --kdb\tOptional KeePass database file to open (must exist)\n" .
-  "    --key\tOptional KeePass key file (must exist)\n" .
+  "    --kdb\tOptional KeePass database file to open (must exist).\n" .
+  "    --key\tOptional KeePass key file (must exist).\n" .
+  "    --histfile\tSpecify your history file (or perhaps /dev/null).\n" .
   "    --readonly\tRun in read-only mode; no changes will be allowed.\n" .
   "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
@@ -1990,6 +2019,15 @@ sub composite_master_pass($$) {
 
   # composite password in case of key file
   if (defined $key_file and length($key_file) and -f $key_file) {
+    # KeePass v2.03 and higher has native key file support, and so we
+    # use that if we have it.
+    if (version->parse($File::KeePass::VERSION) >= version->parse('2.03')) {
+      return [$pass, $key_file];
+    }
+    # TODO - at some point, when File::KeePass v2.03 is very mainstream,
+    # the code to the end of this if block should be removed. It allowed
+    # support for key files for *.kdb files before File::KeePass supported
+    # that natively. File::KeePass now also supports that for *.kdbx.
     open(my $fh,'<',$key_file) || die "Couldn't open key file $key_file: $!\n";
     my $size = -s $key_file;
     read($fh, my $buffer, $size);
@@ -2126,18 +2164,15 @@ Please run the program and type "help" to learn how to use it.
 
 This script requires these non-core modules:
 
-C<Crypt::Rijndael> - "apt-get install libcrypt-rijndael-perl" on Ubuntu
+C<Crypt::Rijndael> - "apt-get install libcrypt-rijndael-perl" on Ubuntu 10.04
 
-C<Term::ReadKey>   - "apt-get install libterm-readkey-perl" on Ubuntu
+C<Term::ReadKey>   - "apt-get install libterm-readkey-perl" on Ubuntu 10.04
 
-C<Sort::Naturally> - "apt-get install libsort-naturally-perl" on Ubuntu
+C<Sort::Naturally> - "apt-get install libsort-naturally-perl" on Ubuntu 10.04
 
-C<Term::ShellUI>   - not packaged on Ubuntu
+C<File::KeePass>   - "apt-get install libfile-keepass-perl" on Ubuntu 12.04
 
-C<File::KeePass>   - not packaged on Ubuntu
-
-Both of the "not packaged" modules above build very cleanly with the
-dh-make-perl tool on Debian and Ubuntu.
+C<Term::ShellUI>   - "apt-get install libterm-shellui-perl" on Ubuntu 12.10
 
 It is also recommended that you install C<Term::ReadLine::Gnu> which will
 give you command history and completion functionality. That module is in
@@ -2267,6 +2302,15 @@ this work would never have been posible.
                       Added the --readonly command line option.
                       Added support for multi-line notes/comments;
                        input ends on a line holding a single ".".
+ 2013-Apr-25 - v1.7 - Patched to use native File::KeePass support for key
+                       files, if the File::KeePass version is new enough.
+                      Added the "version" and "ver" commands.
+                      Updated documentation as Ubuntu 12.10 now packages
+                       all of kpcli's dependencies.
+                      Added --histfile command line option.
+                      Record modified times on edited records, from a patch
+                       with SourceForge ID# 3611713.
+                      Added the -a option to the show command.
 
 =head1 TODO ITEMS
 
