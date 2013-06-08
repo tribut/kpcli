@@ -15,9 +15,9 @@
 #
 ###########################################################################
 
+# The required perl modules
 use strict;                  # core
 use version;                 # core
-use Clone;                   # core
 use FileHandle;              # core
 use Getopt::Long;            # core
 use File::Basename;          # core
@@ -32,17 +32,54 @@ use Term::ShellUI;           # non-core, libterm-shellui-perl on Ubuntu
                              #  - add Term::ReadLine::Gnu for cli history
 use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
                              #  - >=v0.03 needed due critical bug fixes
-$|=1;
+# Pull in optional perl module with run-time loading
+my %OPTIONAL_PM=();
+# Data::Password is needed for the pwck command (check password quality).
+if  (eval {require Data::Password;1;} eq 1) {
+  Data::Password->import( qw(IsBadPassword) );
+  $Data::Password::MINLEN = 8;
+  $Data::Password::MAXLEN = 0;
+  $OPTIONAL_PM{'Data::Password'}->{loaded} = 1;
+} else {
+  $OPTIONAL_PM{'Data::Password'}->{loaded} = 0;
+}
+# Capture::Tiny is needed to safely optionally-load Clipboard.
+if  (eval {require Capture::Tiny;1;} eq 1) {
+  Capture::Tiny->import( qw(capture) );
+  $OPTIONAL_PM{'Capture::Tiny'}->{loaded} = 1;
+} else {
+  $OPTIONAL_PM{'Capture::Tiny'}->{loaded} = 0;
+}
+# Clipboard is needed by the clipboard copy commands (xw, xu, xp, and xx).
+if ($OPTIONAL_PM{'Capture::Tiny'}->{loaded}
+				&& (eval {require Clipboard;1;} eq 1)) {
+  # Clipboard tests its dependencies at import() and writes warnings to STDERR.
+  # Tiny::Capture is used to catch those warnings and we silently hold them
+  # until and unless someone tries to use dependant functions.
+  sub import_clipboard { Clipboard->import(); }
+  my ($out, $err, @result) = capture(\&import_clipboard);
+  if (length($err)) {
+    # Cleanup the error message for for better viewing by the user
+    $err =~ s/^\s+//g; $err =~ s/\s+$//g; $err =~ s/^(.*)$/ > $1/mg;
+    $OPTIONAL_PM{'Clipboard'}->{error} = $err;
+    $OPTIONAL_PM{'Clipboard'}->{loaded} = 0;
+  } else {
+    $OPTIONAL_PM{'Clipboard'}->{loaded} = 1;
+  }
+} else {
+  $OPTIONAL_PM{'Clipboard'}->{loaded} = 0;
+}
+
+$|=1; # flush immediately after writes or prints to STDOUT
 
 my $DEBUG=0;
 my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
 my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
 my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
-my $APP_NAME = basename($0);
-$APP_NAME =~ s/\.pl$//;
-
-my $VERSION = "1.7";
+# Application name and version
+my $APP_NAME = basename($0);  $APP_NAME =~ s/\.pl$//;
+my $VERSION = "2.0";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -183,6 +220,45 @@ my $term = new Term::ShellUI(
              args => \&complete_groups_and_entries,
              method => \&cli_rm,
          },
+         "xu" => {
+             desc => "Copy username to clipboard: xu <entry path|number>",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => sub { cli_xN('xu', @_); }
+         },
+         "xw" => {
+             desc => "Copy URL (www) to clipboard: xw <entry path|number>",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => sub { cli_xN('xw', @_); }
+         },
+         "xp" => {
+             desc => "Copy password to clipboard: xp <entry path|number>",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => sub { cli_xN('xp', @_); }
+         },
+         "xx" => {
+             desc => "Clear the clipboard: xx",
+             minargs => 0, maxargs => 0,
+             method => sub { cli_xN('xx'); }
+         },
+         "pwck" => {
+             desc => "Check password quality: pwck <entry|group>",
+             doc => "\n" .
+		"The pwck command test password quality for entries.\n" .
+		"You can check an individual entry or all entries inside\n" .
+		"of a group, recursively. To check every password in your\n" .
+		"database, use: pwck /\n" .
+		"",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => \&cli_pwck,
+         },
+         "stats" => {
+             desc => "Prints statistics about the open KeePass file",
+             method => \&cli_stats,
+         },
          "show" => {
              desc => "Show an entry: show [-f] [-a] <entry path|entry number>",
              doc => "\n" .
@@ -263,6 +339,7 @@ $term->prompt(\&term_set_prompt);
 our $state={
 	'appname' => $APP_NAME,
 	'term' => $term,
+	'OPTIONAL_PM' => \%OPTIONAL_PM,
 	'kdb_has_changed' => 0,
 	'last_ls_path' => '',
 	'put_master_passwd' => \&put_master_passwd,
@@ -388,10 +465,22 @@ sub build_all_group_paths {
   my $g = shift @_;
   my $root_path = shift @_ || [];
 
+  my $bold="\e[1m";
+  my $red="\e[31m";
+  my $yellow="\e[33m";
+  my $clear="\e[0m";
+
   foreach my $me (@{$g}) {
     my @path_to_me = @{$root_path};
     push @path_to_me, $me->{title};
     my $path=join("\0",@path_to_me);
+    my $err_path = '/' . humanize_path($path);
+    if (defined($hash->{$path})) {
+      print $bold . $yellow .  "WARNING: " . $clear .
+		$red . "Multiple groups titled: $err_path!\n" .
+		$red . "This is unsupported and may cause data loss!\n" .
+		$clear;
+    }
     $hash->{$path}=$me->{id};
 
     if (defined($me->{groups})) {
@@ -408,12 +497,30 @@ sub build_all_entry_paths {
   my $g = shift @_;
   my $root_path = shift @_ || [];
 
+  my $bold="\e[1m";
+  my $red="\e[31m";
+  my $yellow="\e[33m";
+  my $clear="\e[0m";
+
   foreach my $me (@{$g}) {
     my @path_to_me = @{$root_path};
     push @path_to_me, $me->{title};
     if (defined($me->{entries})) {
       foreach my $ent (@{$me->{entries}}) {
         my $path=join( "\0", (@path_to_me, $ent->{title}) );
+        my $err_path = '/' . humanize_path($path);
+        if ($ent->{title} eq '') {
+          print $bold . $yellow .  "WARNING: " . $clear .
+		$red . "There is an entry with a blank title in $err_path!\n" .
+		$clear;
+        }
+        if (defined($hash->{$path}) &&
+				$err_path !~ m/\/Backup\/|\/Meta-Info$/) {
+          print $bold . $yellow .  "WARNING: " . $clear .
+		$red . "Multiple entries titled: $err_path!\n" .
+		$red . "This is unsupported and may cause data loss!\n" .
+		$clear;
+        }
         $hash->{$path}=$ent->{id};
       }
     }
@@ -459,12 +566,14 @@ sub destroy_found {
 sub refresh_state_all_paths() {
   our $state;
 
+  # Build all group paths
   my %all_grp_paths_fwd;
   build_all_group_paths(\%all_grp_paths_fwd,$state->{kdb}->groups);
   my %all_grp_paths_rev = reverse %all_grp_paths_fwd;
   $state->{all_grp_paths_fwd}=\%all_grp_paths_fwd;
   $state->{all_grp_paths_rev}=\%all_grp_paths_rev;
 
+  # Build all entry paths
   my %all_ent_paths_fwd;
   build_all_entry_paths(\%all_ent_paths_fwd,$state->{kdb}->groups);
   my %all_ent_paths_rev = reverse %all_ent_paths_fwd;
@@ -548,6 +657,133 @@ sub group_sort($$) {
 # -------------------------------------------------------------------------
 # All of the cli_*() functions are below here
 # -------------------------------------------------------------------------
+
+# Checks passwords for their quality
+sub cli_pwck {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  # If Data::Password is not avaiable we can't do this for the user
+  if  (! $state->{OPTIONAL_PM}->{'Data::Password'}->{loaded}) {
+    print "Error: pwck requires the Data::Password module.\n";
+    return;
+  }
+
+  my @targets = ();
+  my $target = $params->{args}->[0];
+  # Start by trying to find a single entity with the paramter given.
+  # If no single entity is found then try to find entities based on
+  # assuming that the path given is a group.
+  my $ent=find_target_entity_by_number_or_path($target);
+  if (defined($ent)) {
+    push @targets, $ent;
+  } else {
+    my @groups = ();
+    my $target = normalize_path_string($target);
+    if ($target eq '' || $target eq '.' && get_pwd() eq '/') {
+      @groups = $state->{kdb}->find_groups({}); # Every group in the file!
+    } elsif (defined($state->{all_grp_paths_fwd}->{$target})) {
+      my $group_id = $state->{all_grp_paths_fwd}->{$target};
+      my $this_grp = $state->{kdb}->find_group( { id => $group_id } );
+      @groups = all_child_groups_flattened($group_id);
+      push @groups, $this_grp; # Push this group onto its children
+    }
+    # Loop over each target group adding each of its entries as targets
+    foreach my $group (@groups) {
+      if (defined($group->{entries})) {
+        push @targets, @{$group->{entries}};
+      }
+    }
+  }
+
+  # Test each password, collect the results and record empty passwords
+  my %results=();
+  my @empties = ();
+  foreach my $ent (@targets) {
+    my $pass = $state->{kdb}->locked_entry_password($ent);
+    if (length($pass) == 0) {
+      push @empties, $ent;
+      $results{$ent->{id}} = '';
+    } else {
+      $results{$ent->{id}} = IsBadPassword($pass);
+    }
+  }
+
+  # If we only analyzed one password, return singular-style results
+  if (scalar(@targets) == 1) {
+    my $ent=$targets[0];
+    if (length($results{$ent->{id}})) {
+      print "Password concerns: " . $results{$ent->{id}} . "\n";
+    } elsif (scalar(@empties) > 0) {
+      print "Password field is empty.\n";
+    } else {
+      print "Password strength is good.\n";
+    }
+  } else {
+  # If we analyzed more than one password, return multiple-style results
+    my %problems=();
+    foreach my $ent_id (keys %results) {
+      if (length($results{$ent_id})) {
+        $problems{$state->{all_ent_paths_rev}->{$ent_id}} = $ent_id;
+      }
+    }
+    my $analyzed = scalar(@targets);
+    my $problem_count = scalar(keys %problems);
+    my $empty_count = scalar(@empties);
+    print "$analyzed passwords analyzed, $empty_count blank, " .
+					"$problem_count concerns found";
+    if ($problem_count > 0) { print ":"; } else { print "."; }
+    print "\n";
+    foreach my $path (sort keys %problems) {
+      print humanize_path($path) . ": $results{$problems{$path}}\n";
+    }
+  }
+
+  return 0;
+}
+
+# Prints some statistics about the open KeePass file
+sub cli_stats {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  # Group and entry counts
+  my %stats;
+  $stats{group_count} = scalar(keys(%{$state->{all_grp_paths_fwd}}));
+  $stats{entry_count} = scalar(keys(%{$state->{all_ent_paths_fwd}}));
+
+  # Password lengths
+  my $k=$state->{kdb};
+  my %password_lengths;
+  foreach my $ent_id (values(%{$state->{all_ent_paths_fwd}})) {
+    my $ent = $k->find_entry({id => $ent_id});
+    my $pass_len = length($k->locked_entry_password($ent));
+    if ($pass_len < 1) {
+      $password_lengths{"0"}++;
+    } elsif ($pass_len > 0 && $pass_len < 8) {
+      $password_lengths{"1-7"}++;
+    } elsif ($pass_len > 7 && $pass_len < 12) {
+      $password_lengths{"8-11"}++;
+    } elsif ($pass_len > 11 && $pass_len < 17) {
+      $password_lengths{"12-16"}++;
+    } elsif ($pass_len > 16 && $pass_len < 20) {
+      $password_lengths{"17-19"}++;
+    } elsif ($pass_len > 19) {
+      $password_lengths{"20+"}++;
+    }
+  }
+
+  print "KeePass file version: " . $k->{header}->{version} . "\n" .
+	"Encryption type:      " . $k->{header}->{enc_type} . "\n" .
+	"Encryption rounds:    " . $k->{header}->{rounds} . "\n" .
+	"Number of groups:     $stats{group_count}\n" .
+	"Number of entries:    $stats{entry_count}\n" .
+	"Entries with passwords of length:\n".stats_print(\%password_lengths) .
+	"\n" .
+	"";
+}
 
 sub cli_pwd {
   print get_pwd() . "\n";
@@ -817,6 +1053,67 @@ sub cli_save($) {
   $state->{kdb_file_md5} = Digest::file::digest_file_hex($file, "MD5");
 }
 
+# This subroutine handles the clipboard commands (xw, xu, xp, and xx)
+sub cli_xN($$) {
+  my $xNcmd = shift @_;
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  # If Clipboard is not avaiable we can't do this for the user
+  if  (! $state->{OPTIONAL_PM}->{'Clipboard'}->{loaded}) {
+    print "Error: $xNcmd requires the Clipboard and Capture::Tiny modules:\n" .
+	" - http://search.cpan.org/~king/Clipboard/\n" .
+	" - http://search.cpan.org/~dagolden/Capture-Tiny/\n" .
+	"";
+    if (defined($state->{OPTIONAL_PM}->{'Clipboard'}->{error})) {
+      print "\nThere was an error loading the Clipboard module, as follows:\n" .
+		$state->{OPTIONAL_PM}->{'Clipboard'}->{error} . "\n";
+    }
+    return;
+  }
+
+  # If we're clearing the clipboard, just do that and return immediately.
+  if ($xNcmd eq 'xx') {
+    Clipboard->copy('');
+    print "Clipboard cleared.\n";
+    return;
+  }
+
+  # Find the entry that the user wants to copy to the clipboard from.
+  my $target = $params->{args}->[0];
+  my $ent=find_target_entity_by_number_or_path($target);
+  if (! defined($ent)) {
+    print "Don't see an entry at path: $target\n";
+    return -1;
+  }
+
+  # Switch over the xN commands and place the data into $to_copy
+  my $to_copy = '';
+  SWITCH: {
+    $xNcmd eq 'xu' && do { $to_copy = $ent->{username}; last SWITCH; };
+    $xNcmd eq 'xw' && do { $to_copy = $ent->{url}; last SWITCH; };
+    $xNcmd eq 'xp' && do {
+			$to_copy = $state->{kdb}->locked_entry_password($ent);
+			last SWITCH; };
+    warn "Error: cli_xN() does not know how to handle the $xNcmd command.";
+    $to_copy = undef;
+  }
+
+  # Copy to the clipboard and tell the user what we did.
+  my $cp_map = {
+	'xu' => 'username',
+	'xw' => 'url',
+	'xp' => 'password',
+	};
+  if (defined($to_copy)) {
+    Clipboard->copy($to_copy);
+    print "Copied $cp_map->{$xNcmd} for \"$ent->{title}\" to the clipboard.\n";
+  }
+
+  return;
+}
+
 sub cli_rm($) {
   my $self = shift @_;
   my $params = shift @_;
@@ -1003,13 +1300,12 @@ sub cli_show($$) {
     return -1;
   }
 
-  $state->{kdb}->unlock;
   print "\n";
   if (defined($ent->{path})) {
     print show_format("Path",$ent->{path}) . "\n";
   }
   # Unless -f is specified, we "hide" the password as red-on-red.
-  my $password = $ent->{password};
+  my $password = $state->{kdb}->locked_entry_password($ent);
   if (! defined($opts{f})) {
     $password = colored(['red on_red'], $password);
   }
@@ -1028,7 +1324,6 @@ sub cli_show($$) {
   }
   print "\n";
   print &Dumper($ent) . "\n" if ($DEBUG > 2);
-  $state->{kdb}->lock;
 }
 
 sub cli_edit($) {
@@ -1047,6 +1342,8 @@ sub cli_edit($) {
     return -1;
   }
 
+  # Need to unlock to make edits to the password
+  $state->{kdb}->unlock;
   # Loop through the fields taking edits the user wants to make
   my @fields = get_entry_fields();
   my $had_changes=0;
@@ -1072,19 +1369,17 @@ sub cli_edit($) {
     }
     # If the field was not empty, change it to the new $val
     if (length($val)) {
-      $state->{kdb}->unlock;
       $ent->{$input->{key}} = $val;
-      $state->{kdb}->lock;
       $had_changes=1;
     }
     ReadMode(0); # Return to normal
   }
+  # Relock after editing is complete
+  $state->{kdb}->lock;
 
   # If the use made changes, update modify time and prompt them to save
   if ($had_changes) {
-    $state->{kdb}->unlock;
     $ent->{modified} = $state->{kdb}->now;
-    $state->{kdb}->lock;
     refresh_state_all_paths();
     $state->{kdb_has_changed}=1;
     RequestSaveOnDBChange();
@@ -1149,6 +1444,26 @@ sub show_format($$) {
   return sprintf("%5s: %s", $title,$val);
 }
 
+# Formats a statistic display for cli_stats()
+sub stats_print($) {
+  my $stats_r = shift @_;
+
+  my $max_key_len = 0;
+  my $max_val_len = 0;
+  foreach my $k (keys(%{$stats_r})) {
+    if (length($k) > $max_key_len) { $max_key_len = length($k); }
+  }
+  foreach my $k (values(%{$stats_r})) {
+    if (length($k) > $max_val_len) { $max_val_len = length($k); }
+  }
+  my $sprintf_format = "  - %$max_key_len" . "s: %$max_val_len" . "d\n";
+  my $t='';
+  foreach my $stat_key (sort {$a <=> $b} keys %{$stats_r}) {
+    $t .= sprintf($sprintf_format, $stat_key, $stats_r->{$stat_key});
+  }
+  return $t;
+}
+
 sub get_entry_fields {
   my @fields = (
 	{ key=>'title', txt=>'Title' },
@@ -1198,9 +1513,11 @@ sub cli_icons($) {
     if ($glob_or_rel eq 'g') { # Globally is easy, it's all groups
       my $k=$state->{kdb};
       @{$groups} = $k->find_groups({});
-    } else {
+    } elsif ($glob_or_rel eq 'b') {
       my $id=$state->{path}->{id};
       @{$groups} = all_child_groups_flattened($id); # *only child groups*
+    } else {
+      warn "WHAT? Should never get to this piece of code!\n";
     }
     # If the user wanted to operate on entries, collect all the entries
     # in the @{$groups} and then empty @{$groups}.
@@ -1680,6 +1997,7 @@ sub cli_close {
     }
   }
 
+  $state->{'kdb'}->clear();
   new_kdb($state);
   return 0;
 }
@@ -1913,16 +2231,24 @@ sub complete_groups {
   my $cmpl = shift;
   our $state;
 
-  $self->suppress_completion_append_character();
-
-  my $path = $cmpl->{str} || ".";
+  # Grab the last argument from the command line and put it into $path
+  my $last_arg = $#{$cmpl->{args}};
+  my $path = $cmpl->{args}->[$last_arg] || ".";
   # Tack on trailing slashes for user convenience...
   if ($path =~ m/(^|\/)[.][.]$/) { $path .= "/"; }	# onto "..../.."
   if ($path eq '.') { $path .= "/"; }			# onto a single "."
 
   my $srch_path=normalize_path_string($path);
-  my @possibles = grep(/^$srch_path\0?[^\0]+$/,
+  my @possibles = ();
+  # If the path ends in a "/" (a directory) then we are looking for subirs,
+  # else we are just looking to tab-complete a partial dir-name at this level.
+  if ($path =~ m/\/$/) {
+    @possibles = grep(/^$srch_path\0[^\0]+$/,
 				sort keys %{$state->{all_grp_paths_fwd}});
+  } else {
+    @possibles = grep(/^$srch_path[^\0]*$/,
+				sort keys %{$state->{all_grp_paths_fwd}});
+  }
   my @results=();
   foreach my $opt (@possibles) {
     $opt=humanize_path($opt);
@@ -1955,7 +2281,31 @@ sub complete_groups {
     push @results, "$opt/";
   }
 
-return \@results;
+  # Foreach possibility, we have to strip off the parts that are already
+  # completed and then prepend the part that is looking to be completed,
+  # from $cmpl->{str}.  This is complicated, so be careful messing with it.
+  my @completions = ();
+  foreach my $possibility (@results) {
+    $possibility =~ s/^$path//;
+    if (length($possibility)) {
+      $possibility = $cmpl->{str} . $possibility;
+      push @completions, $possibility;
+    }
+  }
+
+  # If we are about to return only one completion result, we need to first
+  # test to see if any other subdirs are below it and, if so, suppress the
+  # completion append character so that the user can keep tab completing
+  # into lower level directories.
+  if (scalar(@completions) == 1) {
+    my @all_subdirs = grep(/^$srch_path[^\0]*(\0[^\0]+)?/,
+				sort keys %{$state->{all_grp_paths_fwd}});
+    if (scalar(@all_subdirs) > 0) {
+      $self->suppress_completion_append_character();
+    }
+  }
+
+  return \@completions;
 }
 
 sub complete_groups_and_entries {
@@ -1963,11 +2313,10 @@ sub complete_groups_and_entries {
   my $cmpl = shift;
   our $state;
 
-  # Grab the groups for this path
-  my $groups=complete_groups($self,$cmpl);
-
-  # Now gather up the entries (code very similar to complete_groups()
-  my $path = $cmpl->{str} || ".";
+  # Grab the last argument from the command line and put it into $path
+  my $last_arg = $#{$cmpl->{args}};
+  my $path = $cmpl->{args}->[$last_arg] || ".";
+  # Gather up the entries (code very similar to complete_groups())
   my $srch_path=normalize_path_string($path);
   my @entries = grep(/^$srch_path\0?[^\0]*$/,
 				sort keys %{$state->{all_ent_paths_fwd}});
@@ -1989,9 +2338,24 @@ sub complete_groups_and_entries {
     if ($path =~ m/^[.]\// && $opt !~ m/^[.]\//) { $opt = "./$opt"; }
   }
 
-  # Merge the groups and entries
-  my @possibles = sort (@{$groups}, @entries);
-  return \@possibles;
+  # Foreach possibility, we have to strip off the parts that are already
+  # completed and then prepend the part that is looking to be completed,
+  # from $cmpl->{str}.  This is complicated, so be careful messing with it.
+  my @completions = ();
+  foreach my $possibility (@entries) {
+    $possibility =~ s/^$path//;
+    if (length($possibility)) {
+      $possibility = $cmpl->{str} . $possibility;
+      push @completions, $possibility;
+    }
+  }
+
+  # Grab the groups for this path
+  my $groups=complete_groups($self,$cmpl);
+  # Merge the groups and the entries that we built above
+  my @completions = sort (@{$groups}, @completions);
+
+  return \@completions;
 }
 
 ########################################################################
@@ -2164,19 +2528,26 @@ Please run the program and type "help" to learn how to use it.
 
 This script requires these non-core modules:
 
-C<Crypt::Rijndael> - "apt-get install libcrypt-rijndael-perl" on Ubuntu 10.04
+C<Crypt::Rijndael> - libcrypt-rijndael-perl on Ubuntu 10.04
 
-C<Term::ReadKey>   - "apt-get install libterm-readkey-perl" on Ubuntu 10.04
+C<Term::ReadKey>   - libterm-readkey-perl on Ubuntu 10.04
 
-C<Sort::Naturally> - "apt-get install libsort-naturally-perl" on Ubuntu 10.04
+C<Sort::Naturally> - libsort-naturally-perl on Ubuntu 10.04
 
-C<File::KeePass>   - "apt-get install libfile-keepass-perl" on Ubuntu 12.04
+C<File::KeePass>   - libfile-keepass-perl on Ubuntu 12.04
 
-C<Term::ShellUI>   - "apt-get install libterm-shellui-perl" on Ubuntu 12.10
+C<Term::ShellUI>   - libterm-shellui-perl on Ubuntu 12.10
 
 It is also recommended that you install C<Term::ReadLine::Gnu> which will
-give you command history and completion functionality. That module is in
-the libterm-readline-gnu-perl package on Ubuntu.
+give you command history and tab completion functionality. That module is
+in the libterm-readline-gnu-perl package on Ubuntu.
+
+You can optionally install C<Clipboard> and C<Tiny::Capture> to use the
+clipboard features; http://search.cpan.org/~king/Clipboard/ and
+libcapture-tiny-perl on Ubuntu 10.04.
+
+You can optionally install C<Data::Password> to use the pwck feature
+(Password Quality Check); libdata-password-perl on Ubuntu 10.04.
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
@@ -2191,13 +2562,6 @@ I have not found any ill-effect from dropping those fields when saving and
 so that is what kpcli does today to work around this File::KeePass bug.
 
 =head1 BUGS
-
-=head2 Tab Completion
-
-Tab completion is not perfect. It has problems with some entries that
-contain spaces, slashes, and/or backslashes. I don't know if I am doing
-something wrong or if Term::ShellUI may have some bugs in its command
-completion code.
 
 =head2 Using Ctrl-D to Exit
 
@@ -2308,9 +2672,16 @@ this work would never have been posible.
                       Updated documentation as Ubuntu 12.10 now packages
                        all of kpcli's dependencies.
                       Added --histfile command line option.
-                      Record modified times on edited records, from a patch
-                       with SourceForge ID# 3611713.
+                      Record modified times on edited records, from a
+                       patch with SourceForge ID# 3611713.
                       Added the -a option to the show command.
+ 2013-Jun-09 - v2.0 - Removed the unused Clone module after a report that
+                       Clone is no longer in core Perl as of v5.18.0.
+                      Added the stats and pwck commands.
+                      Added clipboard commands (xw/xu/xp/xx).
+                      Fixed some long-standing tab completion bugs.
+                      Warn if multiple groups or entries are titled the
+                       same within a group, except for /Backup entries.
 
 =head1 TODO ITEMS
 
