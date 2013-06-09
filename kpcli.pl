@@ -73,13 +73,14 @@ if ($OPTIONAL_PM{'Capture::Tiny'}->{loaded}
 $|=1; # flush immediately after writes or prints to STDOUT
 
 my $DEBUG=0;
+$Data::Dumper::Useqq = 1;    # Have Dumper escape special chars (like \0)
 my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
 my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
 my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.pl$//;
-my $VERSION = "2.0";
+my $VERSION = "2.1";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -1874,12 +1875,12 @@ sub cli_rmdir($) {
   my $entry_cnt=0;
   if (defined($group->{entries})) {
     $entry_cnt=
-	scalar(grep(m/^$grp_path\0/,keys %{$state->{all_ent_paths_fwd}}));
+	scalar(grep(m/^\Q$grp_path\E\0/,keys %{$state->{all_ent_paths_fwd}}));
   }
   my $group_cnt=0;
   if (defined($group->{entries})) {
     $group_cnt=
-	scalar(grep(m/^$grp_path\0/,keys %{$state->{all_grp_paths_fwd}}));
+	scalar(grep(m/^\Q$grp_path\E\0/,keys %{$state->{all_grp_paths_fwd}}));
   }
   my $child_cnt=$entry_cnt + $group_cnt;
   if ( $child_cnt > 0) {
@@ -2231,24 +2232,41 @@ sub complete_groups {
   my $cmpl = shift;
   our $state;
 
-  # Grab the last argument from the command line and put it into $path
-  my $last_arg = $#{$cmpl->{args}};
-  my $path = $cmpl->{args}->[$last_arg] || ".";
-  # Tack on trailing slashes for user convenience...
-  if ($path =~ m/(^|\/)[.][.]$/) { $path .= "/"; }	# onto "..../.."
-  if ($path eq '.') { $path .= "/"; }			# onto a single "."
+  # Place the string (token) that the user is trying to complete into $path.
+  my $path = $cmpl->{tokens}->[$cmpl->{tokno}];
+  # If the cursor isn't at the end of the sting, chop $path to that length.
+  if (length($path) > $cmpl->{tokoff}) {
+    $path = substr($path, 0, $cmpl->{tokoff});
+  }
 
   my $srch_path=normalize_path_string($path);
   my @possibles = ();
   # If the path ends in a "/" (a directory) then we are looking for subirs,
   # else we are just looking to tab-complete a partial dir-name at this level.
-  if ($path =~ m/\/$/) {
-    @possibles = grep(/^$srch_path\0[^\0]+$/,
+  # Used only for /<tab> (the root dir is a special case)
+  if ($srch_path =~ m/^$|^[.]$/) {
+    @possibles = grep(/^[^\0]+$/,
 				sort keys %{$state->{all_grp_paths_fwd}});
+  # Used only for /..any/thing../<tab> (non-root directories)
+  } elsif (defined($state->{all_grp_paths_fwd}->{$srch_path})) {
+    # If the user is sitting on a dir without the trailing /, return that
+    # now as the only option (/dir1/dir2<tab>). We do this because the
+    # code later does not handle this case well at all. We do, however,
+    # have to not do this for things like "ls <tab>" which is why we test
+    # for length($path).
+    if (length($path) && $path !~ m/\/$/) {
+      $self->suppress_completion_append_character();
+      return [ $cmpl->{str} . "/" ];
+    }
+    @possibles = grep(/^\Q$srch_path\E\0[^\0]+$/,
+				sort keys %{$state->{all_grp_paths_fwd}});
+  # Used for /../any/thing../foo<tab>
   } else {
-    @possibles = grep(/^$srch_path[^\0]*$/,
+    @possibles = grep(/^\Q$srch_path\E[^\0]*$/,
 				sort keys %{$state->{all_grp_paths_fwd}});
   }
+
+  # Loop over the possibilites doing required magic...
   my @results=();
   foreach my $opt (@possibles) {
     $opt=humanize_path($opt);
@@ -2283,12 +2301,14 @@ sub complete_groups {
 
   # Foreach possibility, we have to strip off the parts that are already
   # completed and then prepend the part that is looking to be completed,
-  # from $cmpl->{str}.  This is complicated, so be careful messing with it.
+  # from $cmpl->{str}.
   my @completions = ();
   foreach my $possibility (@results) {
-    $possibility =~ s/^$path//;
+    $possibility = normalize_path_string($possibility);
+    $possibility =~ s/^\Q$srch_path\E\0?//;
     if (length($possibility)) {
-      $possibility = $cmpl->{str} . $possibility;
+      $possibility = $cmpl->{str} . humanize_path($possibility);
+      if ($possibility !~ m/\/$/) { $possibility .= '/'; }
       push @completions, $possibility;
     }
   }
@@ -2298,7 +2318,7 @@ sub complete_groups {
   # completion append character so that the user can keep tab completing
   # into lower level directories.
   if (scalar(@completions) == 1) {
-    my @all_subdirs = grep(/^$srch_path[^\0]*(\0[^\0]+)?/,
+    my @all_subdirs = grep(/^\Q$srch_path\E[^\0]*(\0[^\0]+)?/,
 				sort keys %{$state->{all_grp_paths_fwd}});
     if (scalar(@all_subdirs) > 0) {
       $self->suppress_completion_append_character();
@@ -2308,53 +2328,56 @@ sub complete_groups {
   return \@completions;
 }
 
-sub complete_groups_and_entries {
+sub complete_entries {
   my $self = shift;
   my $cmpl = shift;
   our $state;
 
-  # Grab the last argument from the command line and put it into $path
-  my $last_arg = $#{$cmpl->{args}};
-  my $path = $cmpl->{args}->[$last_arg] || ".";
-  # Gather up the entries (code very similar to complete_groups())
-  my $srch_path=normalize_path_string($path);
-  my @entries = grep(/^$srch_path\0?[^\0]*$/,
-				sort keys %{$state->{all_ent_paths_fwd}});
-  # This loop is modifying @entries values in place!
-  foreach my $opt (@entries) {
-    $opt=humanize_path($opt);
-    if ($path =~ m/^(\/+)/) {
-      $opt=$1.$opt;
-    } else {
-      my $pwd=get_pwd(); $pwd=~s/^\///;
-      $opt=~s/^$pwd\/+//;
-      if ($path =~ m/^[\/.]+/) {
-        $opt=$1.$opt;
-      }
-    }
-    # Lop the leading "./" off the head if it was not user supplied
-    if ($path !~ m/^[.]\// && $opt =~ m/^[.]\//) { $opt =~ s/^[.]\///; }
-    # If the user did supply a leading "./" and we missed it, add it
-    if ($path =~ m/^[.]\// && $opt !~ m/^[.]\//) { $opt = "./$opt"; }
+  # Place the string (token) that the user is trying to complete into $path.
+  my $path = $cmpl->{tokens}->[$cmpl->{tokno}];
+  # If the cursor isn't at the end of the sting, chop $path to that length.
+  if (length($path) > $cmpl->{tokoff}) {
+    $path = substr($path, 0, $cmpl->{tokoff});
   }
 
+  my $srch_path=normalize_path_string($path);
+  my @entries = grep(/^\Q$srch_path\E\0?[^\0]*$/,
+				sort keys %{$state->{all_ent_paths_fwd}});
+  # User can tab exactly at a directory level and with or without the
+  # trailing slash, and so we need to normalize that, always ensuring that
+  # the slash is inserted. We do that by setting the dir_level_sep here
+  # and always removing any trailing slash sent in below (\0 on srch_path).
+  # We do, however, have to not do this for things like "show <tab>" which
+  # is why we test for length($path).
+  my $dir_level_sep = '';
+  if (defined($state->{all_grp_paths_fwd}->{$srch_path}) &&
+				length($path) && $path !~ m/\/$/) {
+    $dir_level_sep = '/';
+  }
   # Foreach possibility, we have to strip off the parts that are already
-  # completed and then prepend the part that is looking to be completed,
-  # from $cmpl->{str}.  This is complicated, so be careful messing with it.
+  # completed and then prepend the part that is looking to be completed
+  # by Term::ShellUI, from $cmpl->{str}.
   my @completions = ();
   foreach my $possibility (@entries) {
-    $possibility =~ s/^$path//;
+    $possibility =~ s/^\Q$srch_path\E\0?//;
     if (length($possibility)) {
-      $possibility = $cmpl->{str} . $possibility;
+      $possibility = $cmpl->{str} .$dir_level_sep. humanize_path($possibility);
       push @completions, $possibility;
     }
   }
 
-  # Grab the groups for this path
-  my $groups=complete_groups($self,$cmpl);
-  # Merge the groups and the entries that we built above
-  my @completions = sort (@{$groups}, @completions);
+  return \@completions;
+}
 
+sub complete_groups_and_entries {
+  my $self = shift;
+  my $cmpl = shift;
+
+  my $groups=complete_groups($self,$cmpl);
+  my $entries=complete_entries($self,$cmpl);
+
+  # Merge and sort the groups and entries
+  my @completions = sort (@{$groups}, @{$entries});
   return \@completions;
 }
 
@@ -2571,13 +2594,13 @@ and it made it into Term::ShellUI v0.9. Please upgrade if kpcli asks you to.
 
 =head2 Multiple Entries or Groups With the Same Name in the Same Group
 
-This program does not support multiple entries in the same group having the
-exact same name, nor does it support multiple groups at the same level
-having the same name, and it likely never will. KeepassX does support those
-and this program needs to be updated to detect and alert when an opened
-database file has those issues, and maybe refuse to save (overwrite) a
-file that is opened like that. Alternatively, we could alert and rename
-offending groups/entries at load time, by appending "-2", "-3", etc.
+This program does not support multiple entries in the same group having
+the exact same name, nor does it support multiple groups at the same
+level having the same name, and it likely never will. KeepassX does
+support those.  This program detects and alert when an opened database
+file has those issues, but it does not refuse to save (overwrite) a file
+that is opened like that. Saves are actually safe (no data loss) as long
+as the user has not touched one of the duplicately-named items.
 
 =head1 AUTHOR
 
@@ -2589,9 +2612,9 @@ This program may be distributed under the same terms as Perl itself.
 
 =head1 CREDITS
 
-Special thanks to Paul Seamons, author of File::KeePass, and to
-Scott Bronson, author of Term::ShellUI. Without those two modules
-this work would never have been posible.
+Special thanks to Paul Seamons, author of C<File::KeePass>, and to
+Scott Bronson, author of C<Term::ShellUI>. Without those two modules
+this program would not have been practical for me to author.
 
 =head1 CHANGELOG
 
@@ -2628,7 +2651,7 @@ this work would never have been posible.
                        - Note: There is a more general bug here that
                                needs addressing (see BUGS section).
                       An empty title on new entry aborts the new entry.
-                      Changed kdb file are now detected/warned about.
+                      Changed kdb files are now detected/warned about.
                       Tested against Term::ShellUI v0.9, which has my EOF
                        hook patch, and updated kpcli comments about it.
                       Term::ShellUI's complete_history() method was
@@ -2682,6 +2705,8 @@ this work would never have been posible.
                       Fixed some long-standing tab completion bugs.
                       Warn if multiple groups or entries are titled the
                        same within a group, except for /Backup entries.
+ 2013-Jun-10 - v2.1 - Fixed several more tab completion bugs, and they
+                       were serious enough to warrant a quick release.
 
 =head1 TODO ITEMS
 
