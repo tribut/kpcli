@@ -16,15 +16,19 @@
 ###########################################################################
 
 # The required perl modules
-use strict;                  # core
-use version;                 # core
-use FileHandle;              # core
-use Getopt::Long;            # core
-use File::Basename;          # core
-use Digest::file;            # core
-use Digest::SHA qw(sha256);  # core
-use Data::Dumper qw(Dumper); # core
-use Term::ANSIColor;         # core
+use strict;                                   # core
+use version;                                  # core
+use FileHandle;                               # core
+use Getopt::Long;                             # core
+use File::Basename;                           # core
+use Digest::file;                             # core
+use Digest::SHA qw(sha256);                   # core
+use Data::Dumper qw(Dumper);                  # core
+use Term::ReadLine;                           # core
+use Term::ANSIColor;                          # core
+use Carp qw(longmess);                        # core
+use Time::HiRes qw(gettimeofday tv_interval); # core
+use POSIX;                   # core, required for unsafe signal handling
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
 use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
@@ -32,7 +36,7 @@ use Term::ShellUI;           # non-core, libterm-shellui-perl on Ubuntu
                              #  - add Term::ReadLine::Gnu for cli history
 use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
                              #  - >=v0.03 needed due critical bug fixes
-# Pull in optional perl module with run-time loading
+# Pull in optional perl modules with run-time loading
 my %OPTIONAL_PM=();
 # Data::Password is needed for the pwck command (check password quality).
 if  (eval {require Data::Password;1;} eq 1) {
@@ -80,7 +84,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.pl$//;
-my $VERSION = "2.1";
+my $VERSION = "2.2";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -374,6 +378,9 @@ if (Term::ShellUI->can('add_eof_exit_hook')) {
   warn "* Please upgrade Term::ShellUI to version 0.9 or newer.\n";
 }
 print "\n";
+
+setup_signal_handling(); # Exactly what the name indicates...
+
 $term->run();
 
 exit;
@@ -701,13 +708,27 @@ sub cli_pwck {
   # Test each password, collect the results and record empty passwords
   my %results=();
   my @empties = ();
+  print "  working...\r";
+  my @busy_chars = qw(\ | / -); my $i=0; my $in=10;
   foreach my $ent (@targets) {
+    printf "%s\r", $busy_chars[int($i/$in)%($#busy_chars+1)] if (!($i++ % $in));
     my $pass = $state->{kdb}->locked_entry_password($ent);
     if (length($pass) == 0) {
       push @empties, $ent;
       $results{$ent->{id}} = '';
     } else {
       $results{$ent->{id}} = IsBadPassword($pass);
+      if ($results{$ent->{id}} =~ m/dictionary word/i) {
+        # IsBadPassword() reports dictionary words that it finds. I don't
+        # like that from a security perspective so we change that here.
+        $results{$ent->{id}} = "contains a dictionary word";
+      }
+    }
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (defined($state->{signals}->{INT}) &&
+			tv_interval($state->{signals}->{INT}) < 0.25) {
+       print "\r"; # Need to return to column 0 of the output line
+       return 0;
     }
   }
 
@@ -758,7 +779,10 @@ sub cli_stats {
   # Password lengths
   my $k=$state->{kdb};
   my %password_lengths;
+  print "  working...\r";
+  my @busy_chars = qw(\ | / -); my $i=0; my $in=100;
   foreach my $ent_id (values(%{$state->{all_ent_paths_fwd}})) {
+    printf "%s\r", $busy_chars[int($i/$in)%($#busy_chars+1)] if (!($i++ % $in));
     my $ent = $k->find_entry({id => $ent_id});
     my $pass_len = length($k->locked_entry_password($ent));
     if ($pass_len < 1) {
@@ -773,6 +797,12 @@ sub cli_stats {
       $password_lengths{"17-19"}++;
     } elsif ($pass_len > 19) {
       $password_lengths{"20+"}++;
+    }
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (defined($state->{signals}->{INT}) &&
+                        tv_interval($state->{signals}->{INT}) < 0.25) {
+       print "\r"; # Need to return to column 0 of the output line
+       return 0;
     }
   }
 
@@ -1389,6 +1419,7 @@ sub cli_edit($) {
 return 0;
 }
 
+# Single line input helper function for cli_new and cli_edit.
 # Single line input helper function for cli_new and cli_edit.
 sub new_edit_single_line_input($) {
   my $input = shift @_;
@@ -2508,6 +2539,94 @@ sub generatePassword {
    return $password
 }
 
+#########################################################################
+# Setup signal handling #################################################
+#########################################################################
+sub setup_signal_handling {
+  our $state;
+
+  # We only worry with signal handling for Term::ReadLine::Gnu
+  if ($state->{'term'}->{term}->ReadLine ne 'Term::ReadLine::Gnu') {
+    return 0;
+  }
+
+  # We don't want Term::Readline::Gnu catching signals, except for WINCH.
+  # I really don't understand why, but I know via experimentation.
+  my $term = $state->{'term'}->{term};
+  $term->Attribs->{catch_signals}  = 0;
+  $term->Attribs->{catch_sigwinch} = 1; # Window resizes
+  $term->clear_signals();
+
+  # Install a signal handler to catch SIGINT (^C). Unsafe signal handling
+  # (through POSIX::SigAction) is required to deal with Term::ReadLine::Gnu.
+  # We don't even try for other readlines due to their limited functionality.
+  sigaction SIGINT, new POSIX::SigAction
+    sub {
+      our $state;
+      # We could be using one of a couple of ReadLine terminals; the one
+      # from Term::ShellUI ($state->{'term'}->{term}) or one from one of
+      # our cli_NNN commands ($state->{active_readline}). We will assume
+      # the Term::ShellUI one here, and override that below if needed.
+      my $term = $state->{'term'}->{term};
+
+      # We need to pull the Carp longmess to see if we're sitting in a
+      # a cli_XXXX function instead of at a readline prompt.
+      my $mess = longmess();
+      #print Dumper( $mess );
+      if ($mess =~ m/main::(cli_\w+)\(/) {
+        #warn "It appears that SIGINT was called from $1\n";
+        # Let certain cli_NNN()s know when a SIGINT was last called
+        $state->{signals}->{INT} = [gettimeofday];
+        # If the cli_NNN has set an active_readline we need to work with it
+#        if (defined($state->{active_readline})) {
+#          my $term = $state->{active_readline};
+#          $term->free_line_state();
+#          $term->cleanup_after_signal();
+#          $term->reset_after_signal();
+#        }
+      } else { # If not in a cli_XXX(), assume a Term::ShellUI prompt
+        my $bold="\e[1m";
+        my $red="\e[31m";
+        my $yellow="\e[33m";
+        my $clear="\e[0m";
+        my $underline=color('underline');
+        #$term->echo_signal_char(SIGINT); # Puts ^C on the next line. :(
+        print "^C$yellow   - use the \"quit\" command to exit.$clear\n";
+        $term->free_line_state();
+        $term->cleanup_after_signal();
+        $term->reset_after_signal();
+        $term->{line_buffer}="";        # Clear the input buffer
+        $term->forced_update_display(); # Force update the display
+      }
+      return 0;
+    };
+
+  # There is a bad assumption in these next two blocks of code, and
+  # that is that the user will only do a Ctrl-Z or continue while
+  # the program is sitting at a Term::ShellUI readline() prompt.
+  # That is safe most of the time, but a TODO item is to go back and
+  # inject code (or find and use a Term::ShellUI interface) to know
+  # if the program was sitting at readline() when these signals fired.
+  #
+  # Handle signal TSTP - terminal stop (user pressing Ctrl-Z)
+  sigaction SIGTSTP, new POSIX::SigAction
+	  sub {
+		our $state;
+		my $term = $state->{'term'}->{term};
+		$term->cleanup_after_signal();
+		$term->reset_after_signal();
+	  };
+  # Handle signal CONT - continue signal (assuming after Ctrl-Z).
+  sigaction SIGCONT, new POSIX::SigAction
+	  sub {
+		our $state;
+		my $term = $state->{'term'}->{term};
+		$term->cleanup_after_signal();
+		$term->reset_after_signal();
+		$term->forced_update_display(); # Force update the display
+	  };
+}
+
 ########################################################################
 # Unix-style, "touch" a file
 ########################################################################
@@ -2541,7 +2660,7 @@ A command line interface (interactive shell) to work with KeePass
 database files (http://http://en.wikipedia.org/wiki/KeePass).  This
 program was inspired by my use of "kedpm -c" combined with my need
 to migrate to KeePass. The curious can read about the Ked Password
-Manager at http://http://kedpm.sourceforge.net/.
+Manager at http://kedpm.sourceforge.net/.
 
 =head1 USAGE
 
@@ -2707,11 +2826,22 @@ this program would not have been practical for me to author.
                        same within a group, except for /Backup entries.
  2013-Jun-10 - v2.1 - Fixed several more tab completion bugs, and they
                        were serious enough to warrant a quick release.
+ 2013-Jun-16 - v2.2 - Trap and handle SIGINT (^C presses).
+                      Trap and handle SIGTSTP (^Z presses).
+                      Trap and handle SIGCONT (continues after ^Z).
+                      Stopped printing found dictionary words in pwck.
 
 =head1 TODO ITEMS
 
- Handle Ctrl-C presses (complicated by Term::ShellUI)
-  - http://mail.pm.org/pipermail/melbourne-pm/2007-January/002214.html
+  Cleanup the suboptimal assumptions around SIGTSTP and SIGCONT.
+  Some work is completed (cli_pwck and cli_stats) but some other is
+  barely even started (cli_new and cli_edit). To do those the "right"
+  way, new_edit_single_line_input() needs to be reworked to use
+  readline() with a prompt, and new_edit_multiline_input() needs to
+  be reviewed and possibly reworked as well.
+
+  Consider http://search.cpan.org/~sherwin/Data-Password-passwdqc/
+  for password quality checking.
 
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
