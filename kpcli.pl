@@ -84,7 +84,7 @@ my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.pl$//;
-my $VERSION = "2.2";
+my $VERSION = "2.3";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -210,13 +210,14 @@ my $term = new Term::ShellUI(
          },
          "ls" => {
              desc => "Lists entries in pwd or in the specified path",
-             minargs => 0, maxargs => 1,
+             minargs => 0, maxargs => 99,
              args => \&complete_groups,
              method => \&cli_ls,
          },
          "new" => {
-             desc => "Create a new entry in the current group (pwd)",
-             minargs => 0, maxargs => 0, args => "",
+             desc => "Create a new entry: new <optional path&|title>",
+             minargs => 0, maxargs => 1,
+             args => [\&complete_groups],
              method => \&cli_new,
          },
          "rm" => {
@@ -367,7 +368,11 @@ print "\n" .
 	"Type 'help <command>' for details on individual commands.\n";
 if ($DEBUG) {print 'Using '.$term->{term}->ReadLine." for readline.\n"; }
 if (! $DEBUG && $term->{term}->ReadLine ne 'Term::ReadLine::Gnu') {
-  warn "* Please install Term::ReadLine::Gnu for better functionality!\n";
+  my $clear="\e[0m";
+  print color('yellow') . "\n" .
+	"* You are using: " . $term->{term}->ReadLine . "\n" .
+	"  Please install Term::ReadLine::Gnu for better functionality!\n" .
+	$clear;
 }
 # My patch made it into Term::ShellUI v0.9, but I still chose not to make
 # this script demand >=0.9 and instead look for the add_eof_exit_hook() and
@@ -423,6 +428,7 @@ sub open_kdb($$) {
 
   # Ask the user for the master password and then open the kdb
   my $master_pass=GetMasterPasswd();
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   $state->{kdb} = File::KeePass->new;
   if (! eval { $state->{kdb}->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
@@ -672,6 +678,8 @@ sub cli_pwck {
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # If Data::Password is not avaiable we can't do this for the user
   if  (! $state->{OPTIONAL_PM}->{'Data::Password'}->{loaded}) {
     print "Error: pwck requires the Data::Password module.\n";
@@ -725,8 +733,7 @@ sub cli_pwck {
       }
     }
     # If the user hit ^C (SIGINT) then we need to stop
-    if (defined($state->{signals}->{INT}) &&
-			tv_interval($state->{signals}->{INT}) < 0.25) {
+    if (recent_sigint()) {
        print "\r"; # Need to return to column 0 of the output line
        return 0;
     }
@@ -771,6 +778,8 @@ sub cli_stats {
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # Group and entry counts
   my %stats;
   $stats{group_count} = scalar(keys(%{$state->{all_grp_paths_fwd}}));
@@ -799,8 +808,7 @@ sub cli_stats {
       $password_lengths{"20+"}++;
     }
     # If the user hit ^C (SIGINT) then we need to stop
-    if (defined($state->{signals}->{INT}) &&
-                        tv_interval($state->{signals}->{INT}) < 0.25) {
+    if (recent_sigint()) {
        print "\r"; # Need to return to column 0 of the output line
        return 0;
     }
@@ -824,6 +832,8 @@ sub cli_cd {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   my $raw_pathstr = $params->{args}->[0];
   # "cd ."
@@ -901,6 +911,8 @@ sub cli_find($) {
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   destroy_found();
 
   # Now do the Title search
@@ -948,6 +960,12 @@ sub cli_find($) {
     $new_ent{full_path} = '/' . humanize_path($nulled_path);
     $k->add_entry(\%new_ent);
     push(@matches, \%new_ent);
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (recent_sigint()) {
+      # If we delete the $FOUND_DIR group it should be safe to leave
+      $k->delete_group({title => $FOUND_DIR});
+      return undef;
+    }
   }
   $k->lock;
 
@@ -1020,6 +1038,7 @@ sub cli_save($) {
   my $self = shift @_;
   my $params = shift @_;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   if (deny_if_readonly()) { return; }
 
   our $state;
@@ -1091,6 +1110,8 @@ sub cli_xN($$) {
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # If Clipboard is not avaiable we can't do this for the user
   if  (! $state->{OPTIONAL_PM}->{'Clipboard'}->{loaded}) {
     print "Error: $xNcmd requires the Clipboard and Capture::Tiny modules:\n" .
@@ -1150,7 +1171,7 @@ sub cli_rm($) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1184,8 +1205,11 @@ sub validate_entry_number($$) {
 
   my ($rGrps,$rEnts) = get_groups_and_entries($path);
   my $entry_max=scalar(@{$rEnts}) - 1;
-  if ($item_number > $entry_max) {
-    print "Invalid item number.  Valid entries are 0-$entry_max.\n";
+  if ($entry_max < 0) {
+    print "Invalid item number. No valid entries in $path.\n";
+    return -1;
+  } elsif ($item_number > $entry_max) {
+    print "Invalid item number. Valid entries in \"$path\" are 0-$entry_max.\n";
     return -1;
   }
 return 0;
@@ -1201,6 +1225,7 @@ sub find_target_entity_by_number_or_path($) {
   our $state;
 
   my $ent=undef; # hope to populate this in a second...
+
 
   # This section looks for an entity by an "ls" number
   if ($target =~ m/^[0-9]+$/) {
@@ -1218,6 +1243,15 @@ sub find_target_entity_by_number_or_path($) {
     $ent = $state->{kdb}->find_entry( {id=>$entry_id} );
   }
 
+  # If we found the entry, place the path to this entry in the entry record,
+  # if it's not already there _and_ if the path we have != $FOUND_DIR.
+  if (defined($ent) &&
+	(!defined($ent->{path})) && $ent->{path} !~ m/^\Q$FOUND_DIR\E$/) {
+    $ent->{full_path} = '/' .
+		humanize_path($state->{all_ent_paths_rev}->{$ent->{id}});
+    $ent->{path} = dirname($ent->{full_path});
+  }
+
   return $ent;
 }
 
@@ -1226,7 +1260,7 @@ sub cli_rename($$) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1242,13 +1276,31 @@ sub cli_rename($$) {
     return -1;
   }
 
-  print "Enter the groups new Title: ";
-  my $new_title = ReadLine(0);
+  my $clear="\e[0m";
+  my $prompt = $clear."Enter the groups new Title: ";
+  my $term = get_prepped_readline_term('');
+  my $new_title = $term->readline($prompt);
+  # If the user hit ^C (SIGINT) then we need to stop
+  if (recent_sigint()) { return undef; }
   chomp($new_title);
   if (length($new_title)) {
-    $state->{kdb}->unlock;
+    if ($new_title =~ m/\//) {
+      print "kpcli cannot support titles with slashes (/) in them.\n";
+      return undef;
+    }
+    # If the titles are the same then there is nothing to do
+    if ($new_title eq $grp->{title}) { return 0; }
+    # Check the new title for same-name conflicts in its group
+    my $path = dirname('/'.humanize_path($dir_normalized));
+    my $testdir=normalize_path_string("$path/$new_title");
+    if (defined($state->{all_grp_paths_fwd}->{$testdir})) {
+      print "An entry titled \"$new_title\" is already in $path.\n";
+      return undef;
+    }
+    # If we passed all of our sanity checks then set the new title
     $grp->{title} = $new_title;
-    $state->{kdb}->lock;
+  } else {
+    return 0;
   }
 
   # Because we renamed a group we must refresh our $state paths
@@ -1262,7 +1314,7 @@ sub cli_mv($$) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1286,9 +1338,11 @@ sub cli_mv($$) {
   }
 
   # Verify no entry title conflict at the new location
-  my $new_entry_path=$dir_normalized . "\0" . $ent->{title};
+  my $new_entry_path=normalize_path_string($target_dir . "/" . $ent->{title});
   if (defined($state->{all_ent_paths_fwd}->{$new_entry_path})) {
-    print "There is already and entry named \"$ent->{title}\" there.\n";
+    my $path = dirname(humanize_path($new_entry_path));
+    print "There is already and entry named \"$ent->{title}\" at $path/.\n";
+    return undef;
   }
 
   # Unlock the kdb, clone the entry, remove its ID and set its new group,
@@ -1312,6 +1366,8 @@ sub cli_show($$) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   # Users can provide a -f option to show the password. We use GetOptions
   # to parse this command line, and $target holds that target.
@@ -1362,7 +1418,7 @@ sub cli_edit($) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1373,43 +1429,41 @@ sub cli_edit($) {
     return -1;
   }
 
-  # Need to unlock to make edits to the password
-  $state->{kdb}->unlock;
   # Loop through the fields taking edits the user wants to make
   my @fields = get_entry_fields();
-  my $had_changes=0;
+  my %changes = ();
   foreach my $input (@fields) {
-    if ($input->{hide_entry}) {
-      print $input->{txt} . ": ";
-    } else {
-      my $val = $ent->{$input->{key}};
-      if ($val =~ m/\r|\n/) { $val = "\n$val\n"; }
-      print $input->{txt} . " (\"".$val."\"): ";
-    }
-    if ($input->{genpasswd}) {
-      print " "x25 . '("g" to generate a password)' . "\r";
-    }
-    if ($input->{hide_entry}) {
-      ReadMode(2); # Hide typing
-    }
     my $val = '';
     if ($input->{multiline}) {
-      $val = new_edit_multiline_input($input);
+      $val = new_edit_multiline_input($input, $ent->{$input->{key}});
     } else {
-      $val = new_edit_single_line_input($input);
+      $val = new_edit_single_line_input($input, $ent->{$input->{key}});
     }
-    # If the field was not empty, change it to the new $val
-    if (length($val)) {
-      $ent->{$input->{key}} = $val;
-      $had_changes=1;
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (recent_sigint()) { return undef; }
+    # Check a new title for same-name conflicts in its group
+    if ($input->{key} eq 'title' && length($val)) {
+      if ($val =~ m/\//) {
+        print "kpcli cannot support titles with slashes (/) in them.\n";
+        return undef;
+      }
+      my $path = $ent->{path}; # The group's path of the entry we are editing
+      my $new_entry = normalize_path_string("$path/$val");
+      if (defined($state->{all_ent_paths_fwd}->{$new_entry})) {
+        print "An entry titled \"$val\" is already in $path.\n";
+        return undef;
+      }
     }
-    ReadMode(0); # Return to normal
-  }
-  # Relock after editing is complete
-  $state->{kdb}->lock;
 
-  # If the use made changes, update modify time and prompt them to save
-  if ($had_changes) {
+    # If the field was not empty, we'll change it to the new $val
+    if (length($val)) { $changes{$input->{key}} = $val; }
+  }
+
+  # If the user made changes, apply them, update modify time and prompt to save
+  if (scalar(keys(%changes)) > 0) {
+    $state->{kdb}->unlock; # Required for the password field
+    foreach my $key (keys %changes) { $ent->{$key} = $changes{$key}; }
+    $state->{kdb}->lock;
     $ent->{modified} = $state->{kdb}->now;
     refresh_state_all_paths();
     $state->{kdb_has_changed}=1;
@@ -1419,30 +1473,105 @@ sub cli_edit($) {
 return 0;
 }
 
+# A code-consolidation function...
+sub get_prepped_readline_term($) {
+  my $initial_value = shift @_; # Initial _value_ for the readline command
+  our $state;
+
+  # Note: A 2nd Term::ReadLine::Gnu->new() just returns the same
+  # object as the one that Term::ShellUI is already using. With
+  # Term::Readline::Perl, an attempt to call new a 2nd time results
+  # in having a Term::Readline::Stub returned and a warning printed to
+  # STDERR, which we also don't want, and so I coded this the way that
+  # I did to make clear what is being done, and this comment for why.
+  my $term = $state->{term}->{term}; # Term::ShellUI's readline
+  $state->{active_readline} = $term;
+
+  # Use Term::ReadLine::Gnu more advanced functionality...
+  if ($term->ReadLine() eq 'Term::ReadLine::Gnu') {
+    # We use the startup_hook to initialize the "value" for user input
+    $term->Attribs->{startup_hook} = sub {
+                $term->Attribs->{startup_hook} = undef;
+		$term->insert_text($initial_value); # Set the input buffer
+	};
+    # Called roughly 10-times per second while Gnu readline waits for input
+    $term->Attribs->{event_hook} = sub {
+          if (recent_sigint()) {
+             $term->Attribs->{event_hook} = undef;
+             $term->set_prompt('');
+             $term->Attribs->{line_buffer}='';
+             $term->Attribs->{done} = 1;
+	     $state->{active_readline} = undef;
+          }
+        };
+  }
+
+  return $term;
+}
+
 # Single line input helper function for cli_new and cli_edit.
-# Single line input helper function for cli_new and cli_edit.
-sub new_edit_single_line_input($) {
+sub new_edit_single_line_input($$) {
   my $input = shift @_;
-  my $val = ReadLine(0);
+  my $initial_value = shift @_;
+  our $state;
+
+  my $iv = ''; if (! $input->{hide_entry}) { $iv = $initial_value; }
+  my $term = get_prepped_readline_term($iv);
+  if ($input->{genpasswd}) {
+    print " "x25 . '("g" to generate a password)' . "\r";
+  }
+  if ($input->{hide_entry}) { ReadMode('noecho'); } # Hide typing
+  my $clear="\e[0m";
+  my $prompt=$clear . $input->{txt};
+  if ($term->ReadLine() eq 'Term::ReadLine::Gnu' || $input->{hide_entry}) {
+    $prompt .= ': ';
+  } else {
+    $prompt .= " ($iv): ";
+  }
+  my $val = $term->readline($prompt);
+  ReadMode('normal'); # Return to normal (unhide typing)
   if ($input->{hide_entry}) { print "\n"; }
   chomp $val;
   if ($input->{genpasswd} && $val eq 'g') {
     $val=generatePassword(20);
   } elsif (length($val) && $input->{double_entry_verify}) {
-    print "Retype to verify: ";
-    my $checkval = ReadLine(0);
+    if ($input->{hide_entry}) { ReadMode('noecho'); } # Hide typing
+    my $checkval = $term->readline($clear."Retype to verify: ");
+    ReadMode('normal'); # Return to normal (unhide typing)
     if ($input->{hide_entry}) { print "\n"; }
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (recent_sigint()) { return undef; }
     chomp $checkval;
     if ($checkval ne $val) {
       print "Entries mismatched. Please try again.\n";
       redo;
     }
   }
+  # We are done with readline calls so let's cleanup.
+  if ($term->ReadLine() eq 'Term::ReadLine::Gnu') {
+    $term->Attribs->{startup_hook} = undef;
+    $term->Attribs->{event_hook} = undef;
+  }
+  # This funciton is supposed to return blank if nothing changed
+  if ($val eq $initial_value) { $val = ''; }
   return $val;
 }
 # Multi-line input helper function for cli_new and cli_edit.
-sub new_edit_multiline_input($) {
+sub new_edit_multiline_input($$) {
   my $input = shift @_;
+  my $initial_value = shift @_;
+  our $state;
+
+  # Protect programmers from accidentally misusing this function
+  if ($input->{genpasswd}) { die "genpasswd unsupported by this function"; }
+
+  if ($input->{hide_entry}) {
+    print $input->{txt} . ": ";
+  } else {
+    my $mlval = $initial_value;
+    if ($mlval =~ m/\r|\n/) { $mlval = "\n$mlval\n"; }
+    print $input->{txt} . " (\"".$mlval."\"): ";
+  }
 
   my $bold="\e[1m";
   my $red="\e[31m";
@@ -1450,15 +1579,21 @@ sub new_edit_multiline_input($) {
   my $clear="\e[0m";
   print "\n$yellow(end multi-line input with a single \".\" on a line)$clear\n";
 
+  # The initial value for multi-line if empty string
+  my $term = get_prepped_readline_term('');
+
   my $val = ''; my $unfinished = 1;
   while ($unfinished) {
-    my $line = ReadLine(0);
+    my $line = $term->readline('');
     if ($line =~ m/^\.[\r\n]*$/) { # a lone "." ends our input
       $unfinished = 0;
     } else {
       $val .= $line;
+      $val .= "\n" if ($val !~ m/\n$/); # ReadLine() vs. $term->readline().
       if ($val =~ m/^[\r\n]*$/) { $val = ''; $unfinished = 0; }
     }
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (recent_sigint()) { return undef; }
   }
   chomp($val); # Remove extra line at the end
   return $val;
@@ -1508,23 +1643,42 @@ sub get_entry_fields {
   return @fields;
 }
 
+# Code consolidation function.
+# Returns true if $state->{signals}->{INT} indicates a SIGINT more
+# recently than the $timeframe given, which defaults to 0.25 secs.
+sub recent_sigint() {
+  my $timeframe = shift @_;
+  if ($timeframe !~ m/^([0-9]*\.[0-9]+|[0-9]+)$/) { $timeframe = 0.25; }
+  our $state;
+  if (defined($state->{signals}->{INT}) &&
+		tv_interval($state->{signals}->{INT}) < $timeframe) {
+    return 1;
+  }
+  return 0;
+}
+
 sub cli_icons($) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   print "Change icons on Groups or Entries (g/e/Cancel)? ";
   my $groups_or_entries=lc(get_single_key());
   print "\n";
-  if ($groups_or_entries !~ m/^[ge]$/) { return; }
+  if (recent_sigint() || $groups_or_entries !~ m/^[ge]$/) { return; }
 
   print "Change icons Here, Below here, or Globally (h/b/g/Cancel)? ";
   my $glob_or_rel=lc(get_single_key());
   print "\n";
-  if ($glob_or_rel !~ m/^[hgb]$/) { return; }
+  if (recent_sigint() || $glob_or_rel !~ m/^[hgb]$/) { return; }
 
   print "What would you line the new icon to be (0-64/Cancel)? ";
-  my $val = ReadLine(0);
+  my $term = get_prepped_readline_term('');
+  my $val = $term->readline('');
+  # If the user hit ^C (SIGINT) then we need to stop
+  if (recent_sigint()) { return undef; }
   chomp($val);
   if ($val !~ m/^[0-9]+$/ || $val < 0 || $val > 64) {
     print "Invalid icon number.\n";
@@ -1586,21 +1740,55 @@ sub cli_new($) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
-  my $pwd=get_pwd();
-  if ($pwd =~ m/^\/+$/) {
-    print "Entries cannot be made in this path ($pwd).\n";
+  my $new_path=get_pwd();
+  my $new_title='';
+  # If the user gave us a path (that may include the new title) in args[0],
+  # then we have to first rationalize that path.
+  if (defined($params->{args}->[0])) {
+    $new_path = $params->{args}->[0];
+    # Insure that $new_path is absolute
+    if ($new_path !~ m/^\/+$/) {
+      $new_path = get_pwd() . '/' . $new_path;
+    }
+    my $norm_path = normalize_path_string($new_path);
+    my ($grp_path,$name)=normalize_and_split_raw_path($new_path);
+    if (defined($state->{all_grp_paths_fwd}->{$norm_path})) {
+      $new_path = '/' . humanize_path($norm_path);
+      $new_title = '';
+    } elsif (defined($state->{all_grp_paths_fwd}->{$grp_path})) {
+      $new_path = '/' . humanize_path($grp_path);
+      $new_title = $name;
+    } else {
+      if ($norm_path eq '') {
+        print "Entries cannot be made in the root path.\n";
+      } else {
+        print "Bad path for new entry\n";
+      }
+      return;
+    }
+  }
+
+  # $id needs to be set to the ID of the group we want to add to
+  my $id = undef;
+  my $norm_path=normalize_path_string($new_path);
+  if (defined($state->{all_grp_paths_fwd}->{$norm_path})) {
+    $id=$state->{all_grp_paths_fwd}->{$norm_path};
+  }
+
+  # Make sure that we have a valid path for creating a new entry
+  if ($new_path =~ m/^\/+$/ || (! defined($id))) {
+    print "Entries cannot be made in this path ($new_path).\n";
     return -1;
   }
 
-  print "Adding new entry to \"$pwd\"\n";
+  print "Adding new entry to \"$new_path\"\n";
 
   # Grab the entries at this $id (pwd) so we can check for conflicts
   my $k=$state->{kdb};
-  my $id=$state->{path}->{id};
   my ($this_grp,@trash) = $k->find_groups({id=>$id});
   my @entries = $k->find_entries({group_id => $id});
 
@@ -1609,26 +1797,36 @@ sub cli_new($) {
   };
 
   my @fields = get_entry_fields();
-  foreach my $input (@fields) {
-    if ($input->{genpasswd}) {
-      print " "x25 . '("g" to generate a password)' . "\r";
-    }
-    print $input->{txt} . ": ";
-    if ($input->{hide_entry}) {
-      ReadMode(2); # Hide typing
-    }
+  NEW_DATA_COLLECTION: foreach my $input (@fields) {
     my $val = '';
     if ($input->{multiline}) {
-      $val = new_edit_multiline_input($input);
+      $val = new_edit_multiline_input($input, '');
     } else {
-      $val = new_edit_single_line_input($input);
+      if ($new_title ne '' && $input->{key} eq 'title') {
+        print $input->{txt} . ": $new_title\n";
+        $val = $new_title;
+      } else {
+        $val = new_edit_single_line_input($input, '');
+      }
     }
+    # If the user hit ^C, abort the new entry
+    if (recent_sigint()) { return undef; }
     # If the user gave us an empty title, abort the new entry
-    if ($input->{key} eq 'title' && length($val) == 0) {
-      return;
+    if ($input->{key} eq 'title' && length($val) == 0) { return undef; }
+    # Check the new title for same-name conflicts in its group
+    if ($input->{key} eq 'title') {
+      if ($val =~ m/\//) {
+        print "kpcli cannot support titles with slashes (/) in them.\n";
+        return undef;
+      }
+      my $new_entry = normalize_path_string($new_path . '/' . $val);
+      if (defined($state->{all_ent_paths_fwd}->{$new_entry})) {
+        print "An entry titled \"$val\" is already in $new_path.\n";
+        return undef;
+      }
     }
+
     $new_entry->{$input->{key}} = $val;
-    ReadMode(0); # Return to normal
   }
   $new_entry->{icon} = $DEFAULT_ENTRY_ICON;
 
@@ -1645,13 +1843,13 @@ sub cli_new($) {
   return 0;
 }
 
-sub cli_import($$) {
+sub cli_import {
   my $file=shift @_;
   my $new_group=shift @_;
   my $key_file=shift @_;
   our $state;
 
-  if (deny_if_readonly()) { return; }
+  if (recent_sigint() || deny_if_readonly()) { return; }
 
   # If the user gave us a bogus file there's nothing to do
   if (! -f ($file)) {
@@ -1681,6 +1879,7 @@ sub cli_import($$) {
   }
   # Ask the user for the master password and then open the kdb
   my $master_pass=GetMasterPasswd();
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   my $iKDB = File::KeePass->new;
   if (! eval { $iKDB->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
@@ -1714,6 +1913,8 @@ sub cli_export($$) {
   my $key_file=shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # Warn is we are being asked to overwrite a file
   if (-e $file) {
     print "WARNING: $file already exists.\n" .
@@ -1727,16 +1928,20 @@ sub cli_export($$) {
 
   # Get the master password for the exported file
   my $master_pass=GetMasterPasswd();
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   if (length($master_pass) == 0) {
     print "For your safety, empty passwords are not allowed...\n";
     return;
   }
-  print "Retype to verify: ";
+  my $clear="\e[0m";
+  my $prompt = $clear."Retype to verify: ";
+  my $term = get_prepped_readline_term('');
   ReadMode('noecho');
-  my $checkval = ReadLine(0);
+  my $checkval = $term->readline($prompt);
   ReadMode('normal');
   chomp $checkval;
   print "\n";
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   if ($master_pass ne $checkval) {
     print "Passwords did not match...\n";
     return;
@@ -1820,6 +2025,8 @@ sub cli_saveas($) {
   my $key_file=shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # If the user has asked for a *.kdbx file, check the File::KeePass version
   if (version->parse($File::KeePass::VERSION) < version->parse('2.03')) {
     if ($file =~ m/\.kdbx$/i) {
@@ -1828,13 +2035,29 @@ sub cli_saveas($) {
     }
   }
 
+  # Warn is we are being asked to overwrite a file
+  if (-e $file) {
+    print "WARNING: $file already exists.\n" .
+                "Overwrite it? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+    if (recent_sigint()) { return undef; } # Bail on SIGINT
+  }
+
   my $master_pass=GetMasterPasswd();
-  print "Retype to verify: ";
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+  my $clear="\e[0m";
+  my $prompt = $clear."Retype to verify: ";
+  my $term = get_prepped_readline_term('');
   ReadMode('noecho');
-  my $checkval = ReadLine(0);
+  my $checkval = $term->readline($prompt);
   ReadMode('normal');
   chomp $checkval;
   print "\n";
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   if ($master_pass ne $checkval) {
     print "Passwords did not match...\n";
     return;
@@ -1886,7 +2109,7 @@ sub cli_rmdir($) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1937,7 +2160,7 @@ sub cli_mkdir($) {
   my $params = shift @_;
   our $state;
 
-  if (deny_if_readonly() || warn_if_file_changed()) {
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
     return;
   }
 
@@ -1990,6 +2213,8 @@ sub cli_open($) {
   my $key=shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   # If cli_close() does not return 0 the user decided not to close the file
   if (cli_close() != 0) {
     return -1;
@@ -2007,10 +2232,14 @@ sub cli_open($) {
 
 # Get a single keypress from the user
 sub get_single_key {
+  our $state;
   my $key='';
   ReadMode('raw'); # Turn off controls keys
   while (not defined ($key = ReadKey(-1))) {
-    # No key yet
+    # If the user hit ^C (SIGINT) then we need to stop
+    if (recent_sigint()) { return undef; }
+    # No key yet, but let's not eat 100% CPU while waiting, so sleep.
+    Time::HiRes::sleep(0.1);
   }
   ReadMode('restore');
 return $key;
@@ -2018,6 +2247,8 @@ return $key;
 
 sub cli_close {
   our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   if ($state->{kdb_has_changed}) {
     print "WARNING: The database has changed and was not saved.\n" .
@@ -2051,39 +2282,54 @@ sub new_kdb($) {
   cli_cd($term, {'args' => ["/"]});
 }
 
-sub cli_ls($) {
+sub cli_ls($$) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
 
-  my $path=$params->{'args'}->[0];
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
 
-  # If we were given a path, use cli_cd() to go there temporarily...
-  my $old_path='';
-  if (length($path)) {
-    $old_path=get_pwd();
-    if (cli_cd($term, {'args' => [$path]})) {
-      return -1; # If cli_cd() returned non-zero it failed
+  my @paths = @{$params->{'args'}};
+  if (scalar(@paths) == 0) { push @paths, ''; }
+  my $paths_count = scalar(@paths);
+  my $loops=0;
+  foreach my $path (@paths) {
+    # If multiple dirs are being listed, title each
+    if ($paths_count > 1) {
+      $path =~ s/\/+$//; print "$path/:\n";
+    }
+
+    # If we were given a path, use cli_cd() to go there temporarily...
+    my $old_path='';
+    if (length($path)) {
+      $old_path=get_pwd();
+      if (cli_cd($term, {'args' => [$path]})) {
+        return -1; # If cli_cd() returned non-zero it failed
+      }
+    }
+
+    # List the pwd
+    $state->{last_ls_path} = get_pwd();
+    my ($rGrps,$rEnts) = get_current_groups_and_entries();
+    if (scalar(@{$rGrps}) > 0) {
+      print "=== Groups ===\n";
+      print join("\n", @{get_human_group_list($rGrps)}) . "\n";
+    }
+    if (scalar(@{$rEnts}) > 0) {
+      print "=== Entries ===\n";
+      print join("\n", @{get_human_entry_list($rEnts)}) . "\n";
+    }
+
+    # If we temporarily cd'ed, cd back.
+    if (length($old_path)) {
+      cli_cd($term, {'args' => [$old_path]});
+    }
+
+    # If printing multiple dirs, we need to append a \n to all but the last
+    if ($paths_count > 1 && ++$loops < $paths_count) {
+      print "\n";
     }
   }
-
-  # List the pwd
-  $state->{last_ls_path} = get_pwd();
-  my ($rGrps,$rEnts) = get_current_groups_and_entries();
-  if (scalar(@{$rGrps}) > 0) {
-    print "=== Groups ===\n";
-    print join("\n", @{get_human_group_list($rGrps)}) . "\n";
-  }
-  if (scalar(@{$rEnts}) > 0) {
-    print "=== Entries ===\n";
-    print join("\n", @{get_human_entry_list($rEnts)}) . "\n";
-  }
-
-  # If we temporarily cd'ed, cd back.
-  if (length($old_path)) {
-    cli_cd($term, {'args' => [$old_path]});
-  }
-
   return 0;
 }
 
@@ -2131,6 +2377,8 @@ sub cli_quit($$) {
   my $params = shift @_;
   our $state;
 
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
   if ($state->{kdb_has_changed}) {
     print "WARNING: The database has changed and was not saved.\n" .
 	"Really quit? [y/N] ";
@@ -2174,12 +2422,15 @@ sub RequestSaveOnDBChange {
 }
 
 sub GetMasterPasswd {
-  print "Please provide the master password: ";
+  my $clear="\e[0m";
+  my $prompt = $clear."Please provide the master password: ";
+  my $term = get_prepped_readline_term('');
   ReadMode('noecho');
-  my $master_pass = ReadLine(0);
-  chomp $master_pass;
+  my $master_pass = $term->readline($prompt);
   ReadMode('normal');
+  chomp $master_pass;
   print "\n";
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
   return $master_pass;
 }
 
@@ -2404,8 +2655,8 @@ sub complete_groups_and_entries {
   my $self = shift;
   my $cmpl = shift;
 
-  my $groups=complete_groups($self,$cmpl);
-  my $entries=complete_entries($self,$cmpl);
+  my $groups = complete_groups($self,$cmpl);
+  my $entries = complete_entries($self,$cmpl);
 
   # Merge and sort the groups and entries
   my @completions = sort (@{$groups}, @{$entries});
@@ -2464,6 +2715,7 @@ sub composite_master_pass($$) {
     } else {
       $pass .= substr(sha256($buffer),0,32);
     }
+    # TODO - this marks the "end of the block" noted above.
   }
 
   return $pass;
@@ -2569,50 +2821,57 @@ sub setup_signal_handling {
       # the Term::ShellUI one here, and override that below if needed.
       my $term = $state->{'term'}->{term};
 
+      # Record in our state when a SIGINT was last received
+      $state->{signals}->{INT} = [gettimeofday];
+
       # We need to pull the Carp longmess to see if we're sitting in a
       # a cli_XXXX function instead of at a readline prompt.
       my $mess = longmess();
       #print Dumper( $mess );
       if ($mess =~ m/main::(cli_\w+)\(/) {
         #warn "It appears that SIGINT was called from $1\n";
-        # Let certain cli_NNN()s know when a SIGINT was last called
-        $state->{signals}->{INT} = [gettimeofday];
-        # If the cli_NNN has set an active_readline we need to work with it
-#        if (defined($state->{active_readline})) {
-#          my $term = $state->{active_readline};
-#          $term->free_line_state();
-#          $term->cleanup_after_signal();
-#          $term->reset_after_signal();
-#        }
+        #warn "LHHD: $mess\n";
+        # If the cli_NNN has an active_readline we need to work with it
+        if (defined($state->{active_readline})) {
+          #warn "LHHD: in INT with active_readline\n";
+          my $term = $state->{active_readline};
+          $term->free_line_state();
+          $term->cleanup_after_signal();
+          $term->reset_after_signal();
+          $term->Attribs->{line_buffer}=''; # Clear the buffer
+          $term->Attribs->{done}=1;  # Ask readline to return immediately
+        }
       } else { # If not in a cli_XXX(), assume a Term::ShellUI prompt
-        my $bold="\e[1m";
-        my $red="\e[31m";
-        my $yellow="\e[33m";
-        my $clear="\e[0m";
+        my $yellow=color('yellow');
         my $underline=color('underline');
+        my $clear="\e[0m";
         #$term->echo_signal_char(SIGINT); # Puts ^C on the next line. :(
-        print "^C$yellow   - use the \"quit\" command to exit.$clear\n";
+        # Trial and error on these readline_state values...  :(
+        #warn "LHHD: " . sprintf($term->Attribs->{readline_state}) . "\n";
+        if ($term->Attribs->{readline_state} == 262374) {
+          print "^C$yellow   - use Ctrl-g to stop history search.$clear\n";
+        } else {
+          print "^C$yellow   - use the \"quit\" command to exit.$clear\n";
+        }
         $term->free_line_state();
         $term->cleanup_after_signal();
         $term->reset_after_signal();
-        $term->{line_buffer}="";        # Clear the input buffer
-        $term->forced_update_display(); # Force update the display
+        $term->Attribs->{line_buffer}=""; # Clear the input buffer
+        $term->forced_update_display();   # Force update the display
       }
       return 0;
     };
 
-  # There is a bad assumption in these next two blocks of code, and
-  # that is that the user will only do a Ctrl-Z or continue while
-  # the program is sitting at a Term::ShellUI readline() prompt.
-  # That is safe most of the time, but a TODO item is to go back and
-  # inject code (or find and use a Term::ShellUI interface) to know
-  # if the program was sitting at readline() when these signals fired.
-  #
   # Handle signal TSTP - terminal stop (user pressing Ctrl-Z)
   sigaction SIGTSTP, new POSIX::SigAction
 	  sub {
 		our $state;
 		my $term = $state->{'term'}->{term};
+		my $mess = longmess();
+		if ($mess =~ m/main::(cli_\w+)\(/ &&
+				defined($state->{active_readline})) {
+		  $term = $state->{active_readline};
+		}
 		$term->cleanup_after_signal();
 		$term->reset_after_signal();
 	  };
@@ -2621,6 +2880,11 @@ sub setup_signal_handling {
 	  sub {
 		our $state;
 		my $term = $state->{'term'}->{term};
+		my $mess = longmess();
+		if ($mess =~ m/main::(cli_\w+)\(/ &&
+				defined($state->{active_readline})) {
+		  $term = $state->{active_readline};
+		}
 		$term->cleanup_after_signal();
 		$term->reset_after_signal();
 		$term->forced_update_display(); # Force update the display
@@ -2693,15 +2957,18 @@ You can optionally install C<Data::Password> to use the pwck feature
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
-Only interoperability with KeePassX (http://www.keepassx.org/) has been
-tested.  File::KeePass seems to have a bug related to some "unknown" data
-that KeePassX stores in the *.kdb file. This program deletes those unknown
-data when saving. Research into libkpass http://libkpass.sourceforge.net/)
-has revealed what File::KeePass classifies as "unknown" are the times for
-created/modified/accessed/expires as well as "flags" (id=9), but only for
-groups -- File::KeePass seems to handle those fields just fine for entries.
-I have not found any ill-effect from dropping those fields when saving and
-so that is what kpcli does today to work around this File::KeePass bug.
+Only interoperability tested with KeePassX (http://www.keepassx.org/).
+
+Prior to version 2.3, File::KeePass had a bug related to some "unknown"
+data that KeePassX stores in group records. For File::KeePass < v2.3,
+kpcli deletes those unknown data when saving. Research in the libkpass
+(http://libkpass.sourceforge.net/) source code revealed that what early
+versions of File::KeePass classifies as "unknown" are the times for
+created/modified/accessed/expires as well as "flags" (id=9), but only
+for groups; File::KeePass handled those fields just fine for entries.
+I found no ill-effect from dropping those fields when saving and so
+that is what kpcli does to work around the File::KeePass bug, if kpcli
+is using File::KeePass < v2.3.
 
 =head1 BUGS
 
@@ -2830,15 +3097,17 @@ this program would not have been practical for me to author.
                       Trap and handle SIGTSTP (^Z presses).
                       Trap and handle SIGCONT (continues after ^Z).
                       Stopped printing found dictionary words in pwck.
+ 2013-Jul-01 - v2.3 - More readline() and signal handling improvements.
+                      Title conflict checks in cli_new()/edit()/mv().
+                      Group title conflict checks in rename().
+                      cli_new() now accepts optional path&|title param.
+                      cli_ls() can now list multiple paths.
+                      cli_edit() now shows the "old" values for users
+                       to edit, if Term::ReadLine::Gnu is available.
+                      cli_edit() now aborts all changes on ^C.
+                      cli_saveas() now asks before overwriting a file.
 
 =head1 TODO ITEMS
-
-  Cleanup the suboptimal assumptions around SIGTSTP and SIGCONT.
-  Some work is completed (cli_pwck and cli_stats) but some other is
-  barely even started (cli_new and cli_edit). To do those the "right"
-  way, new_edit_single_line_input() needs to be reworked to use
-  readline() with a prompt, and new_edit_multiline_input() needs to
-  be reviewed and possibly reworked as well.
 
   Consider http://search.cpan.org/~sherwin/Data-Password-passwdqc/
   for password quality checking.
