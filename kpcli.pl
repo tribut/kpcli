@@ -27,6 +27,7 @@ use Data::Dumper qw(Dumper);                  # core
 use Term::ReadLine;                           # core
 use Term::ANSIColor;                          # core
 use Carp qw(longmess);                        # core
+use English qw(-no_match_vars);               # core
 use Time::HiRes qw(gettimeofday tv_interval); # core
 use POSIX;                   # core, required for unsafe signal handling
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
@@ -39,39 +40,37 @@ use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
 # Pull in optional perl modules with run-time loading
 my %OPTIONAL_PM=();
 # Data::Password is needed for the pwck command (check password quality).
-if  (eval {require Data::Password;1;} eq 1) {
-  Data::Password->import( qw(IsBadPassword) );
+if (runtime_load_module(\%OPTIONAL_PM,'Data::Password',[qw(IsBadPassword)])) {
+  no warnings 'once';
   $Data::Password::MINLEN = 8;
   $Data::Password::MAXLEN = 0;
-  $OPTIONAL_PM{'Data::Password'}->{loaded} = 1;
-} else {
-  $OPTIONAL_PM{'Data::Password'}->{loaded} = 0;
 }
 # Capture::Tiny is needed to safely optionally-load Clipboard.
-if  (eval {require Capture::Tiny;1;} eq 1) {
-  Capture::Tiny->import( qw(capture) );
-  $OPTIONAL_PM{'Capture::Tiny'}->{loaded} = 1;
-} else {
-  $OPTIONAL_PM{'Capture::Tiny'}->{loaded} = 0;
-}
 # Clipboard is needed by the clipboard copy commands (xw, xu, xp, and xx).
-if ($OPTIONAL_PM{'Capture::Tiny'}->{loaded}
-				&& (eval {require Clipboard;1;} eq 1)) {
+if (runtime_load_module(\%OPTIONAL_PM,'Capture::Tiny',[qw(capture)])) {
   # Clipboard tests its dependencies at import() and writes warnings to STDERR.
   # Tiny::Capture is used to catch those warnings and we silently hold them
   # until and unless someone tries to use dependant functions.
-  sub import_clipboard { Clipboard->import(); }
-  my ($out, $err, @result) = capture(\&import_clipboard);
+  my ($out, $err, @result) = capture(
+		sub { runtime_load_module(\%OPTIONAL_PM,'Clipboard',undef); } );
   if (length($err)) {
     # Cleanup the error message for for better viewing by the user
     $err =~ s/^\s+//g; $err =~ s/\s+$//g; $err =~ s/^(.*)$/ > $1/mg;
     $OPTIONAL_PM{'Clipboard'}->{error} = $err;
-    $OPTIONAL_PM{'Clipboard'}->{loaded} = 0;
-  } else {
-    $OPTIONAL_PM{'Clipboard'}->{loaded} = 1;
   }
 } else {
+  # If we didn't get Capture::Tiny, also mark Clipboard as not loaded.
   $OPTIONAL_PM{'Clipboard'}->{loaded} = 0;
+}
+# Win32::Console::ANSI is needed to emulate ANSI colors on Windows
+if (lc($OSNAME) =~ m/^mswin/) {
+  if (! runtime_load_module(\%OPTIONAL_PM,'Win32::Console::ANSI',undef)) {
+    # If we don't have Win32::Console::ANSI then we want to override
+    # &main::color() and colored() from Term::ANSIColor with NOOPs.
+    no strict 'refs';
+    *color = sub { my $color = shift @_; return ''; };
+    *colored = sub { my $color = shift @_; my $text=shift @_; return $text; };
+  }
 }
 
 $|=1; # flush immediately after writes or prints to STDOUT
@@ -83,8 +82,8 @@ my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
 my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 
 # Application name and version
-my $APP_NAME = basename($0);  $APP_NAME =~ s/\.pl$//;
-my $VERSION = "2.3";
+my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
+my $VERSION = "2.4";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -92,24 +91,39 @@ my $opts=MyGetOpts();   # Will only return with options we think we can use
 # Setup our Term::ShellUI object
 my $term = new Term::ShellUI(
     app => $APP_NAME,
+    term => get_readline_term(\%OPTIONAL_PM, $APP_NAME),
     history_file => $HISTORY_FILE,
     keep_quotes => 0,
     commands => {
          #"" => { args => sub { shift->complete_history(@_) } },
          "history" => { desc => "Prints the command history",
-            doc => "\nSpecify a number to list the last N lines of history" .
-            "Pass -c to clear the command history, " .
-            "-d NUM to delete a single item\n",
+            doc => "\nSpecify a number to list the last N lines of history.\n" .
+            "Pass -c to clear the command history.\n" .
+            "Pass -d NUM to delete a single item.\n",
             args => "[-c] [-d] [number]",
             method => sub { shift->history_call(@_) },
 	    exclude_from_history => 1,
          },
-         "version" => {
+         "ver" => {
              desc => "Print the version of this program",
-             method => sub { print "$VERSION\n"; },
+             doc => "\n" .
+		"Add the -v option to get an inventory of the versions\n" .
+		"of the various dependencies being used. Please provide\n" .
+		"that information in any bug reports filed.\n" .
+		"",
+             method => \&cli_version,
+             minargs => 0, maxargs => 1,
 	     exclude_from_history => 1,
          },
-         "ver" => { alias => "version",
+         "version" => { alias => "ver",
+		exclude_from_completion=>1, exclude_from_history => 1,},
+         "vers" => {
+             desc => "Same as \"ver -v\"",
+             minargs => 0, maxargs => 0,
+             method => sub { cli_version(shift, { args => ['-v'] }); },
+		exclude_from_completion=>1, exclude_from_history => 1,
+         },
+         "versions" => { alias => "vers",
 		exclude_from_completion=>1, exclude_from_history => 1,},
          "help" => {
              desc => "Print helpful information",
@@ -216,6 +230,14 @@ my $term = new Term::ShellUI(
          },
          "new" => {
              desc => "Create a new entry: new <optional path&|title>",
+             doc => "\n" .
+		"The new command is used to create a new entry.\n" .
+		"\n" .
+		"Usage is straightforward. For password generation, the\n" .
+		"\"g\" method produces a string of random characters while\n" .
+		"the \"w\" method creates a 4-word string inspired by\n" .
+		"\"correct horse battery staple\" (http://xkcd.com/936/)\n" .
+		"",
              minargs => 0, maxargs => 1,
              args => [\&complete_groups],
              method => \&cli_new,
@@ -289,6 +311,14 @@ my $term = new Term::ShellUI(
          },
          "edit" => {
              desc => "Edit an entry: edit <path to entry|entry number>",
+             doc => "\n" .
+		"The edit command is used to modify an entry.\n" .
+		"\n" .
+		"Usage is straightforward. For password generation, the\n" .
+		"\"g\" method produces a string of random characters while\n" .
+		"the \"w\" method creates a 4-word string inspired by\n" .
+		"\"correct horse battery staple\" (http://xkcd.com/936/)\n" .
+		"",
              minargs => 1, maxargs => 1,
              args => \&complete_groups_and_entries,
              method => \&cli_edit,
@@ -319,8 +349,10 @@ my $term = new Term::ShellUI(
              desc => "Finds entries by Title",
              doc => "\n" .
 		"Searches for entries with the given search term\n" .
-		"in their title and places matches into \"/$FOUND_DIR/\".\n",
-             minargs => 1, maxargs => 1, args => "<search string>",
+		"in their title and places matches into \"/$FOUND_DIR/\".\n" .
+		"\n" .
+		"Add -a to search data fields beyond just the title.\n",
+             minargs => 1, maxargs => 2, args => "<search string>",
              method => \&cli_find,
          },
          "pwd" => {
@@ -368,15 +400,14 @@ print "\n" .
 	"Type 'help <command>' for details on individual commands.\n";
 if ($DEBUG) {print 'Using '.$term->{term}->ReadLine." for readline.\n"; }
 if (! $DEBUG && $term->{term}->ReadLine ne 'Term::ReadLine::Gnu') {
-  my $clear="\e[0m";
   print color('yellow') . "\n" .
-	"* You are using: " . $term->{term}->ReadLine . "\n" .
-	"  Please install Term::ReadLine::Gnu for better functionality!\n" .
-	$clear;
+	"* NOTE: You are using " . $term->{term}->ReadLine . ".\n" .
+	"  Term::ReadLine::Gnu will provide better functionality.\n" .
+	color('clear');
 }
 # My patch made it into Term::ShellUI v0.9, but I still chose not to make
-# this script demand >=0.9 and instead look for the add_eof_exit_hook() and
-# use it if it exists and warn if not.
+# this program demand >=0.9 and instead look for the add_eof_exit_hook()
+# and use it if it exists and warn if not.
 if (Term::ShellUI->can('add_eof_exit_hook')) {
   $term->add_eof_exit_hook(\&eof_exit_hook);
 } else {
@@ -394,34 +425,32 @@ exit;
 ############################################################################
 ############################################################################
 
-sub open_kdb($$) {
+sub open_kdb {
   my $file=shift @_;
   my $key_file=shift @_;
   our $state;
 
-  # Make sure the file exists and is readable
+  # Make sure the file exists, is readable, and is a keepass file
   if (! -f $file) {
     return "File does not exist: $file";
   }
   if (! -r $file) {
     return "File is not readable: $file";
   }
+  if (magic_file_type($file) ne 'keepass') {
+    return "Does not appear to be a KeePass file: $file";
+  }
 
   # Look for lock file and warn if it is found
   my $lock_file = $file . '.lock'; # KeePassX style
   if (-f $lock_file) {
-    my $bold="\e[1m";
-    my $red="\e[31m";
-    my $yellow="\e[33m";
-    my $clear="\e[0m";
-    print $bold . $yellow .
+    print color('bold yellow') .
 	"WARNING:" .
-	$clear .
-	$red .
+	color('clear') . color('red') .
 	       " A KeePassX-style lock file is in place for this file.\n" .
-	"         It may be opened elsewhere." .
-				"$yellow$bold  Be careful of saving!\n" .
-	$clear;
+		"         It may be opened elsewhere." .
+		" " . color('bold yellow') . "Be careful of saving!\n" .
+	color('clear');
   } else {
     $state->{placed_lock_file} = $lock_file;
   }
@@ -463,10 +492,6 @@ sub term_set_prompt($$) {
   my $raw_cmd=shift @_;
   our $state;
 
-  my $pwd=$state->{all_grp_paths_rev}->{$state->{path}->{id}};
-  $pwd =~ s%/%\\/%g;
-  $pwd =~ s/\0/\//g;
-
   my $app=$state->{appname};
   my $pwd=get_pwd();
   return "$app:$pwd> ";
@@ -479,21 +504,16 @@ sub build_all_group_paths {
   my $g = shift @_;
   my $root_path = shift @_ || [];
 
-  my $bold="\e[1m";
-  my $red="\e[31m";
-  my $yellow="\e[33m";
-  my $clear="\e[0m";
-
   foreach my $me (@{$g}) {
     my @path_to_me = @{$root_path};
     push @path_to_me, $me->{title};
     my $path=join("\0",@path_to_me);
     my $err_path = '/' . humanize_path($path);
     if (defined($hash->{$path})) {
-      print $bold . $yellow .  "WARNING: " . $clear .
-		$red . "Multiple groups titled: $err_path!\n" .
-		$red . "This is unsupported and may cause data loss!\n" .
-		$clear;
+      print color('bold yellow') .  "WARNING: " . color('clear') .
+	color('red') . "Multiple groups titled: $err_path!\n" .
+	color('red') . "This is unsupported and may cause data loss!\n" .
+	color('clear');
     }
     $hash->{$path}=$me->{id};
 
@@ -511,10 +531,7 @@ sub build_all_entry_paths {
   my $g = shift @_;
   my $root_path = shift @_ || [];
 
-  my $bold="\e[1m";
-  my $red="\e[31m";
-  my $yellow="\e[33m";
-  my $clear="\e[0m";
+  my $red=color('red');
 
   foreach my $me (@{$g}) {
     my @path_to_me = @{$root_path};
@@ -524,16 +541,16 @@ sub build_all_entry_paths {
         my $path=join( "\0", (@path_to_me, $ent->{title}) );
         my $err_path = '/' . humanize_path($path);
         if ($ent->{title} eq '') {
-          print $bold . $yellow .  "WARNING: " . $clear .
+          print color('bold yellow') . "WARNING: " . color('clear') .
 		$red . "There is an entry with a blank title in $err_path!\n" .
-		$clear;
+		color('clear');
         }
         if (defined($hash->{$path}) &&
 				$err_path !~ m/\/Backup\/|\/Meta-Info$/) {
-          print $bold . $yellow .  "WARNING: " . $clear .
+          print color('bold yellow') . "WARNING: " . color('clear') .
 		$red . "Multiple entries titled: $err_path!\n" .
 		$red . "This is unsupported and may cause data loss!\n" .
-		$clear;
+		color('clear');
         }
         $hash->{$path}=$ent->{id};
       }
@@ -628,7 +645,7 @@ sub get_groups_and_entries {
 
 # This function takes a group ID and returns all of the child
 # groups of that group, flattened.
-sub all_child_groups_flattened($) {
+sub all_child_groups_flattened {
   my $group_id=shift @_;
   our $state;
 
@@ -915,9 +932,22 @@ sub cli_find($) {
 
   destroy_found();
 
-  # Now do the Title search
+  # Users can provide a -a option to search more than just the title. We
+  # use GetOpts to parse this command line.
+  my $search_str='';
+  my %opts=();
+  {
+    local @ARGV = @{$params->{args}};
+    my $result = &GetOptions(\%opts, 'f', 'a');
+    if (scalar(@ARGV) != 1) {
+      return -1;
+    }
+    $search_str = $ARGV[0];
+  }
+
+
+  # Now do the search
   my $k=$state->{kdb};
-  my $search_str = $params->{args}->[0];
   print "Searching for \"$search_str\" ...\n";
 
   # Make $search_str a case-insensitive regex
@@ -929,14 +959,21 @@ sub cli_find($) {
   }
   $search_str=join('', @letters);
 
-  # Search entries by title, skipping the KeePassX /Backup group if it exists
-  my $search_params = { 'title =~' => $search_str };
-  my $backup_dir_normalized=normalize_path_string("/Backup"); # /Backup
-  if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
-    $search_params->{'group_id !'} =
-		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
+  my @srch_flds = qw(title);
+  if ($opts{'a'}) {
+    @srch_flds = qw(title username comment url);
   }
-  my @e = $k->find_entries($search_params);
+  my @e = ();
+  foreach my $fld (@srch_flds) {
+    # Search entries by title, skipping the KeePassX /Backup group if it exists
+    my $search_params = { "$fld =~" => $search_str };
+    my $backup_dir_normalized=normalize_path_string("/Backup"); # /Backup
+    if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
+      $search_params->{'group_id !'} =
+		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
+    }
+    push @e, $k->find_entries($search_params);
+  }
 
   if ( scalar(@e) < 1) {
     print "No matches.\n";
@@ -948,6 +985,7 @@ sub cli_find($) {
   my $found_gid = $found_group->{'id'};
   $k->unlock;
   my @matches=();
+  my %duplicates=();
   FINDS: foreach my $ent (@e) {
     my %new_ent = %{$ent}; # Clone the entity
     $new_ent{id} = int(rand(1000000000000000)); # A random new id
@@ -958,6 +996,8 @@ sub cli_find($) {
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
     $new_ent{path} = '/' . dirname(humanize_path($nulled_path)) . '/';
     $new_ent{full_path} = '/' . humanize_path($nulled_path);
+    if (defined($duplicates{$new_ent{full_path}})) { next FINDS; }
+    $duplicates{$new_ent{full_path}} = 1;
     $k->add_entry(\%new_ent);
     push(@matches, \%new_ent);
     # If the user hit ^C (SIGINT) then we need to stop
@@ -1062,17 +1102,11 @@ sub cli_save($) {
   # Check for a lock file that we did not place there
   my $lock_file = $state->{kdb_file} . '.lock'; # KeePassX style
   if (-f $lock_file && $state->{placed_lock_file} ne $lock_file) {
-    my $bold="\e[1m";
-    my $red="\e[31m";
-    my $yellow="\e[33m";
-    my $clear="\e[0m";
-    print $bold . $yellow .
-        "WARNING:" .
-        $clear .
-        $red .
+    print color('bold yellow') .  "WARNING:" . color('clear') .
+        color('red') .
                " A KeePassX-style lock file is in place for this file.\n" .
-        "         It may be opened elsewhere. Save anyway? [y/N] " .
-        $clear;
+		"         It may be opened elsewhere. Save anyway? [y/N] " .
+        color('clear');
     my $key=get_single_key();
     print "\n";
     if (lc($key) ne 'y') {
@@ -1276,9 +1310,8 @@ sub cli_rename($$) {
     return -1;
   }
 
-  my $clear="\e[0m";
-  my $prompt = $clear."Enter the groups new Title: ";
-  my $term = get_prepped_readline_term('');
+  my $prompt = color('clear')."Enter the groups new Title: ";
+  my $term = get_prepped_readline_term();
   my $new_title = $term->readline($prompt);
   # If the user hit ^C (SIGINT) then we need to stop
   if (recent_sigint()) { return undef; }
@@ -1408,6 +1441,9 @@ sub cli_show($$) {
 	show_format("Icon#",$ent->{icon}) . "\n" .
 	show_format("Creat",$ent->{created}) . "\n" .
 	show_format("Modif",$ent->{modified}) . "\n";
+    if (defined($ent->{expires})) {
+      print show_format("Xpire",$ent->{expires}) . "\n";
+    }
   }
   print "\n";
   print &Dumper($ent) . "\n" if ($DEBUG > 2);
@@ -1474,8 +1510,7 @@ return 0;
 }
 
 # A code-consolidation function...
-sub get_prepped_readline_term($) {
-  my $initial_value = shift @_; # Initial _value_ for the readline command
+sub get_prepped_readline_term() {
   our $state;
 
   # Note: A 2nd Term::ReadLine::Gnu->new() just returns the same
@@ -1489,11 +1524,6 @@ sub get_prepped_readline_term($) {
 
   # Use Term::ReadLine::Gnu more advanced functionality...
   if ($term->ReadLine() eq 'Term::ReadLine::Gnu') {
-    # We use the startup_hook to initialize the "value" for user input
-    $term->Attribs->{startup_hook} = sub {
-                $term->Attribs->{startup_hook} = undef;
-		$term->insert_text($initial_value); # Set the input buffer
-	};
     # Called roughly 10-times per second while Gnu readline waits for input
     $term->Attribs->{event_hook} = sub {
           if (recent_sigint()) {
@@ -1516,29 +1546,32 @@ sub new_edit_single_line_input($$) {
   our $state;
 
   my $iv = ''; if (! $input->{hide_entry}) { $iv = $initial_value; }
-  my $term = get_prepped_readline_term($iv);
+  my $term = get_prepped_readline_term();
   if ($input->{genpasswd}) {
-    print " "x25 . '("g" to generate a password)' . "\r";
+    print " "x25 . '("g" or "w" to generate a password)' . "\r";
   }
-  if ($input->{hide_entry}) { ReadMode('noecho'); } # Hide typing
-  my $clear="\e[0m";
-  my $prompt=$clear . $input->{txt};
-  if ($term->ReadLine() eq 'Term::ReadLine::Gnu' || $input->{hide_entry}) {
-    $prompt .= ': ';
+  my $prompt=$input->{txt} . ': ';
+  my $val = '';
+  if ($input->{hide_entry}) {
+    $val = GetPassword($prompt, '');
   } else {
-    $prompt .= " ($iv): ";
+    $val = $term->readline($prompt, $iv);
   }
-  my $val = $term->readline($prompt);
-  ReadMode('normal'); # Return to normal (unhide typing)
-  if ($input->{hide_entry}) { print "\n"; }
   chomp $val;
-  if ($input->{genpasswd} && $val eq 'g') {
-    $val=generatePassword(20);
+  if ($input->{genpasswd} && $val =~ m/^[wg]$/) {
+    if ($val eq 'g') {
+      $val = generatePasswordGobbledygook(20);
+    } else {
+      $val = generatePassword();
+    }
   } elsif (length($val) && $input->{double_entry_verify}) {
-    if ($input->{hide_entry}) { ReadMode('noecho'); } # Hide typing
-    my $checkval = $term->readline($clear."Retype to verify: ");
-    ReadMode('normal'); # Return to normal (unhide typing)
-    if ($input->{hide_entry}) { print "\n"; }
+    my $prompt = "Retype to verify: ";
+    my $checkval = '';
+    if ($input->{hide_entry}) {
+      $checkval = GetPassword($prompt, '');
+    } else {
+      $checkval = $term->readline($prompt);
+    }
     # If the user hit ^C (SIGINT) then we need to stop
     if (recent_sigint()) { return undef; }
     chomp $checkval;
@@ -1573,18 +1606,18 @@ sub new_edit_multiline_input($$) {
     print $input->{txt} . " (\"".$mlval."\"): ";
   }
 
-  my $bold="\e[1m";
-  my $red="\e[31m";
-  my $yellow="\e[33m";
-  my $clear="\e[0m";
+  my $yellow=color('yellow');
+  my $clear=color('clear');
   print "\n$yellow(end multi-line input with a single \".\" on a line)$clear\n";
 
-  # The initial value for multi-line if empty string
-  my $term = get_prepped_readline_term('');
+  my $term = get_prepped_readline_term();
 
   my $val = ''; my $unfinished = 1;
   while ($unfinished) {
-    my $line = $term->readline('');
+    # Term::ReadLine::Perl seems to have a bug that requires a prompt
+    # (it borks on ''), but after adding the pipe I liked it so left
+    # it place for all readlines.
+    my $line = $term->readline('| ');
     if ($line =~ m/^\.[\r\n]*$/) { # a lone "." ends our input
       $unfinished = 0;
     } else {
@@ -1675,7 +1708,7 @@ sub cli_icons($) {
   if (recent_sigint() || $glob_or_rel !~ m/^[hgb]$/) { return; }
 
   print "What would you line the new icon to be (0-64/Cancel)? ";
-  my $term = get_prepped_readline_term('');
+  my $term = get_prepped_readline_term();
   my $val = $term->readline('');
   # If the user hit ^C (SIGINT) then we need to stop
   if (recent_sigint()) { return undef; }
@@ -1845,7 +1878,7 @@ sub cli_new($) {
 
 sub cli_import {
   my $file=shift @_;
-  my $new_group=shift @_;
+  my $new_group_path=shift @_;
   my $key_file=shift @_;
   our $state;
 
@@ -1856,18 +1889,22 @@ sub cli_import {
     print "File does not exist: $file\n";
     return -1;
   }
-  # If the $new_group path is relative, make it absolute
-  if ($new_group !~ m/^\//) {
-    $new_group = get_pwd() . "/$new_group";
+  if (magic_file_type($file) ne 'keepass') {
+    print "Does not appear to be a KeePass file: $file\n";
+    return -1;
+  }
+  # If the $new_group_path is a relative path, make it absolute
+  if ($new_group_path !~ m/^\//) {
+    $new_group_path = get_pwd() . "/$new_group_path";
   }
   # We won't import into an existing group
-  my $full_path=normalize_path_string($new_group);
+  my $full_path=normalize_path_string($new_group_path);
   if (defined($state->{all_grp_paths_fwd}->{$full_path})) {
     print "You must specify a _new_ group to import into.\n";
     return -1;
   }
   # Make sure the new group's parent exists
-  my ($grp_path,$grp_name)=normalize_and_split_raw_path($new_group);
+  my ($grp_path,$grp_name)=normalize_and_split_raw_path($new_group_path);
   if ($grp_path != '' && ! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
     print "Path does not exist: /" . humanize_path($grp_path) . "\n";
     return -1;
@@ -1927,23 +1964,11 @@ sub cli_export($$) {
   }
 
   # Get the master password for the exported file
-  my $master_pass=GetMasterPasswd();
+  my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
+  if (! defined($master_pass)) { return undef; }
   if (length($master_pass) == 0) {
     print "For your safety, empty passwords are not allowed...\n";
-    return;
-  }
-  my $clear="\e[0m";
-  my $prompt = $clear."Retype to verify: ";
-  my $term = get_prepped_readline_term('');
-  ReadMode('noecho');
-  my $checkval = $term->readline($prompt);
-  ReadMode('normal');
-  chomp $checkval;
-  print "\n";
-  if (recent_sigint()) { return undef; } # Bail on SIGINT
-  if ($master_pass ne $checkval) {
-    print "Passwords did not match...\n";
     return;
   }
 
@@ -1991,7 +2016,7 @@ sub cli_export($$) {
 # copy to. It copies everything from the source group's root downward. In our
 # use cases, the _target_ $kdb object passed in here is typically a different
 # one than the _source_ $group is from.
-sub copy_kdb_group_tree($$$) {
+sub copy_kdb_group_tree {
   my $kdb=shift @_;
   my $group=shift @_;
   my $parent_group=shift @_ || undef; # When undef, it writes to the root
@@ -2047,19 +2072,12 @@ sub cli_saveas($) {
     if (recent_sigint()) { return undef; } # Bail on SIGINT
   }
 
-  my $master_pass=GetMasterPasswd();
+  # Get the master password for the file
+  my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
-  my $clear="\e[0m";
-  my $prompt = $clear."Retype to verify: ";
-  my $term = get_prepped_readline_term('');
-  ReadMode('noecho');
-  my $checkval = $term->readline($prompt);
-  ReadMode('normal');
-  chomp $checkval;
-  print "\n";
-  if (recent_sigint()) { return undef; } # Bail on SIGINT
-  if ($master_pass ne $checkval) {
-    print "Passwords did not match...\n";
+  if (! defined($master_pass)) { return undef; }
+  if (length($master_pass) == 0) {
+    print "For your safety, empty passwords are not allowed...\n";
     return;
   }
 
@@ -2234,6 +2252,7 @@ sub cli_open($) {
 sub get_single_key {
   our $state;
   my $key='';
+  $|=1; # Needed to flush STDOUT on Windows cmd prior to calling ReadMode
   ReadMode('raw'); # Turn off controls keys
   while (not defined ($key = ReadKey(-1))) {
     # If the user hit ^C (SIGINT) then we need to stop
@@ -2266,7 +2285,7 @@ sub cli_close {
 }
 
 # This sets $state to a brand new, KeePassX-style, empty, unsaved database
-sub new_kdb($) {
+sub new_kdb {
   my $state=shift @_;
   $state->{kdb_has_changed}=0;
   $state->{'kdb'} = File::KeePass->new;
@@ -2289,7 +2308,11 @@ sub cli_ls($$) {
 
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
-  my @paths = @{$params->{'args'}};
+  my @paths = ();
+  if (defined($params) && defined($params->{'args'}) &&
+				ref($params->{'args'}) eq 'ARRAY') {
+    @paths = @{$params->{'args'}};
+  }
   if (scalar(@paths) == 0) { push @paths, ''; }
   my $paths_count = scalar(@paths);
   my $loops=0;
@@ -2395,6 +2418,49 @@ sub cli_quit($$) {
   return 0; # It's OK to quit
 }
 
+sub cli_version($$) {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
+  # Users can provide a -f option to show the password. We use GetOptions
+  # to parse this command line, and $target holds that target.
+  my $target='';
+  my %opts=();
+  {
+    local @ARGV = @{$params->{args}};
+    my $result = &GetOptions(\%opts, 'v');
+  }
+
+  if ($opts{'v'}) {
+    print "VERSIONS\n";
+    print " * kpcli: $VERSION\n";
+    my $pv = $PERL_VERSION;
+    if (! length($pv)) {
+      $pv = $]; # For perl versions prior to 5.6.0
+    }
+    print " * Perl: $pv\n";
+    my @modules = qw(File::KeePass Term::ShellUI Term::ReadKey Term::ReadLine);
+    foreach my $module (sort keys %OPTIONAL_PM) {
+      if ($OPTIONAL_PM{$module}->{loaded}) {
+        push @modules, $module;
+      }
+    }
+    foreach my $module (@modules) {
+      no strict 'refs';
+      my $vstr=$module . "::VERSION";
+      print " * $module: " . ${$vstr} . "\n";
+    }
+    print "\n";
+    print "ReadLine being used: " . $term->{term}->ReadLine . "\n";
+    print "Operating system: $OSNAME\n";
+  } else {
+    print "$VERSION\n";
+  }
+}
+
 # Function to nag the user about saving each time the DB is modified
 sub RequestSaveOnDBChange {
   our $state;
@@ -2422,11 +2488,69 @@ sub RequestSaveOnDBChange {
 }
 
 sub GetMasterPasswd {
-  my $clear="\e[0m";
-  my $prompt = $clear."Please provide the master password: ";
-  my $term = get_prepped_readline_term('');
+  my $prompt = "Please provide the master password: ";
+  return GetPassword($prompt,'*');
+}
+
+sub GetMasterPasswdDoubleEntryVerify {
+  my $master_pass=GetMasterPasswd();
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
+  if (length($master_pass) == 0) { return ''; }
+
+  my $prompt = "Retype to verify: ";
+  my $checkval = GetPassword($prompt,'*');
+  chomp $checkval;
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+  if ($master_pass ne $checkval) {
+    print "Passwords did not match...\n";
+    return undef;
+  }
+
+  return $master_pass;
+}
+
+
+sub GetPassword {
+  my $prompt = shift @_;
+  my $echo_char = shift @_ || '';
+
+  if (length($echo_char) > 1) {
+    warn "GetPassword() cannot accept an \$echo_char of more than one char.\n";
+    $echo_char='';
+  }
+
+  $|=1; # Needed to flush STDOUT on Windows cmd prior to calling ReadMode
   ReadMode('noecho');
-  my $master_pass = $term->readline($prompt);
+  ReadMode('raw');
+  my $master_pass = '';
+  print $prompt;
+  CHAR: while (1) {
+    my $c;
+    do {
+      Time::HiRes::sleep(0.05);
+    } until defined($c = ReadKey(-1));
+    last if $c =~ m/[\n\r]/;
+    if (ord($c) == 3) { # ^C
+      print "\n";
+      ReadMode('normal');
+      return '';
+    } elsif (ord($c) == 127 || ord($c) == 8) { # backspace (Linux/Windows)
+      if (length($master_pass)) {
+        print chr(8)." ".chr(8);
+        chop($master_pass);
+      }
+      next CHAR;
+    } elsif (ord($c) == 21) { # ^U
+      my $passlen=length($master_pass);
+      print chr(8)x$passlen." "x$passlen.chr(8)x$passlen;
+      $master_pass = '';
+      next CHAR;
+    }
+    if (length($echo_char)) { print $echo_char; }
+    #print "*".ord($c);
+    $master_pass .= $c;
+  }
   ReadMode('normal');
   chomp $master_pass;
   print "\n";
@@ -2449,7 +2573,11 @@ sub MyGetOpts {
   if (defined($opts{histfile}) && length($opts{histfile})) {
     our $HISTORY_FILE = $opts{histfile};
   } else {
-    our $HISTORY_FILE = "~/.$APP_NAME-history";
+    if (lc($OSNAME) =~ m/^mswin/) {
+      our $HISTORY_FILE = $ENV{USERPROFILE} . "/.$APP_NAME-history";
+    } else {
+      our $HISTORY_FILE = "~/.$APP_NAME-history";
+    }
   }
 
   my @errs=();
@@ -2480,8 +2608,8 @@ sub GetUsageMessage {
   "    --readonly\tRun in read-only mode; no changes will be allowed.\n" .
   "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
-  "about kpcli's commands.\n";
-  "\n";
+  "about kpcli's commands.\n" .
+  "";
   return $t;
 }
 
@@ -2537,7 +2665,7 @@ sub complete_groups {
     # have to not do this for things like "ls <tab>" which is why we test
     # for length($path).
     if (length($path) && $path !~ m/\/$/) {
-      $self->suppress_completion_append_character();
+      __my_suppress_completion_append_character($self);
       return [ $cmpl->{str} . "/" ];
     }
     @possibles = grep(/^\Q$srch_path\E\0[^\0]+$/,
@@ -2603,7 +2731,7 @@ sub complete_groups {
     my @all_subdirs = grep(/^\Q$srch_path\E[^\0]*(\0[^\0]+)?/,
 				sort keys %{$state->{all_grp_paths_fwd}});
     if (scalar(@all_subdirs) > 0) {
-      $self->suppress_completion_append_character();
+      __my_suppress_completion_append_character($self);
     }
   }
 
@@ -2661,6 +2789,30 @@ sub complete_groups_and_entries {
   # Merge and sort the groups and entries
   my @completions = sort (@{$groups}, @{$entries});
   return \@completions;
+}
+
+# In Term::ReadLine::Gnu, suppress_completion_append_character() works,
+# but in Term::ReadLine::Perl and Term::ReadLine::Perl5 it does not, and
+# so we get to the outcome via $readline::rl_completer_terminator_character.
+sub __my_suppress_completion_append_character($self) {
+  my $self = shift;
+  if ($self->{term}->ReadLine eq 'Term::ReadLine::Gnu') {
+    $self->suppress_completion_append_character();
+  } else {
+    # For Term::ReadLine::Perl
+    # From Term/ReadLine/readline.pm
+    #  - package readline;
+    if (defined($readline::rl_completer_terminator_character)) {
+      $readline::rl_completer_terminator_character='';
+    }
+    # For Term::ReadLine::Perl5
+    # From Term/ReadLine/Perl5/readline.pm
+    #  - package Term::ReadLine::Perl5::readline;"
+    if (defined(
+	$Term::ReadLine::Perl5::readline::rl_completer_terminator_character)) {
+      $Term::ReadLine::Perl5::readline::rl_completer_terminator_character='';
+    }
+  }
 }
 
 ########################################################################
@@ -2751,17 +2903,11 @@ sub warn_if_file_changed {
   if (! length($file)) { return 0; } # If no file was opened, don't warn
   my $file_md5 = Digest::file::digest_file_hex($file, "MD5");
   if ($state->{kdb_file_md5} ne $file_md5) {
-    my $bold="\e[1m";
-    my $red="\e[31m";
-    my $yellow="\e[33m";
-    my $clear="\e[0m";
-    print $bold . $yellow .
-        "WARNING:" .
-        $clear .
-        $red .
+    print color('bold yellow') . "WARNING:" . color('clear') .
+        color('red') .
                " The file has changed on disk since kpcli opened it!\n" .
         "         It may be opened elsewhere. Continue anyway? [y/N] " .
-        $clear;
+        color('clear');
     my $key=get_single_key();
     print "\n";
     if (lc($key) ne 'y') {
@@ -2773,6 +2919,20 @@ sub warn_if_file_changed {
 }
 
 sub generatePassword {
+  my $be_silent = shift @_ || 0;
+  my $password = generatePasswordFromDict($be_silent);
+  if (! length($password)) {
+    if (! $be_silent) {
+      print color('yellow') .
+	"Generated random characters instead of a words-based password.\n" .
+	color('clear');
+    }
+    $password = generatePasswordGobbledygook(20);
+  }
+  return $password;
+}
+
+sub generatePasswordGobbledygook {
    my $length = shift;
    my @normal_chars=('a'..'z','A'..'Z',0..9);
    my @special_chars=qw(_);
@@ -2790,6 +2950,51 @@ sub generatePassword {
    }
    return $password
 }
+
+# Inspired by http://xkcd.com/936/
+sub generatePasswordFromDict($) {
+  my $be_silent = shift @_ || 0;
+  my @words=();
+  my $fh = new FileHandle;
+  my @dict_files = qw(/usr/share/dict/words /usr/dict/words);
+  DICTS: foreach my $dictfile (@dict_files) {
+    if (-f $dictfile && -r $dictfile && open($fh,'<', $dictfile)) {
+      @words = <$fh>;
+      close($fh);
+      last DICTS;
+    }
+  }
+  if (scalar(@words) < 10000) {
+    if (! $be_silent) {
+      print color('yellow') .
+	"No adequate dictionary found to generate a words-based password.\n".
+	"These locations were checked:\n - ".join("\n - ", @dict_files)."\n" .
+	color('clear');
+    }
+    return undef;
+  }
+  my $length_tries = 12;
+  my $password='';
+  do {
+    my @passwords = ();
+    my $word_tries=20;
+    while (scalar(@passwords) < 4 && $word_tries-- > 0) {
+      my $word = $words[int(rand(scalar(@words)))];
+      chomp $word;
+      $word =~ s/[^a-zA-Z0-9]//g;
+      if (length($word) > 7) { next; } # Don't care for big words
+      push @passwords, $word;
+    }
+    if (scalar(@passwords) == 4) {
+      $password=join('.', @passwords);
+    }
+    #warn "LHHD: $password\n";
+    if (length($password) < 27) { $password=''; } # Need a decent overall size
+  } until (length($password) || $length_tries-- < 0);
+
+  return $password;
+}
+
 
 #########################################################################
 # Setup signal handling #################################################
@@ -2843,8 +3048,7 @@ sub setup_signal_handling {
         }
       } else { # If not in a cli_XXX(), assume a Term::ShellUI prompt
         my $yellow=color('yellow');
-        my $underline=color('underline');
-        my $clear="\e[0m";
+        my $clear=color('clear');
         #$term->echo_signal_char(SIGINT); # Puts ^C on the next line. :(
         # Trial and error on these readline_state values...  :(
         #warn "LHHD: " . sprintf($term->Attribs->{readline_state}) . "\n";
@@ -2891,6 +3095,133 @@ sub setup_signal_handling {
 	  };
 }
 
+# Code consolidation function to runtime-load optional perl modules
+sub runtime_load_module($$$) {
+  my $rOPTIONAL_PM = shift @_;
+  my $module = shift @_;
+  my $rImportList = shift @_ || undef;
+  my $iltxt = '';
+  if (defined($rImportList) && ref($rImportList) ne 'ARRAY') {
+    die "The rImportList param to runtime_load_module() must be an ARRAY ref\n";
+  }
+  if (defined($rImportList) && ref($rImportList) eq 'ARRAY' &&
+						scalar(@$rImportList) > 0) {
+    $iltxt = "('" . join("','", @{$rImportList}) . "')";
+  }
+  if (eval "require $module;$module->import($iltxt);1;" eq 1) {
+    $rOPTIONAL_PM->{$module}->{loaded} = 1;
+    return 1;
+  } else {
+    $rOPTIONAL_PM->{$module}->{loaded} = 0;
+    return 0;
+  }
+}
+
+# This routine runs down the list of our preferred Term::ReadLine::*
+# modules and returns a new object from the first one that we find.
+sub get_readline_term($$) {
+  my $rOPTIONAL_PM = shift @_;
+  my $app_name = shift @_;
+  my @rl_modules = ();
+  push @rl_modules, 'Term::ReadLine::Gnu';
+  push @rl_modules, 'Term::ReadLine::Perl';
+  push @rl_modules, 'Term::ReadLine::Perl5';
+  my $rl_term = undef;
+  my $hold_TERM=undef;
+  MODULE: foreach my $module (@rl_modules) {
+    # On MS Windows, Term::ReadLine::Perl and Term::ReadLine::Perl5 are
+    # pretty good terminals but they behave badly if the environment
+    # variable TERM=dumb, and so we override that here if needed.
+    if (lc($OSNAME) =~ m/^mswin/ && $module =~ m/^Term::ReadLine::Perl5?/ &&
+						$ENV{'TERM'} eq 'dumb') {
+      $hold_TERM=$ENV{'TERM'};
+      $ENV{'TERM'} = 'vt102';
+    }
+    if (runtime_load_module($rOPTIONAL_PM,$module,undef) eq 1) {
+      $rl_term = eval "$module->new('$app_name');";
+      last MODULE;
+    } else {
+      #warn "Loading $module failed\n";
+      if (defined($hold_TERM)) { $ENV{'TERM'} = $hold_TERM; $hold_TERM=undef; }
+    }
+  }
+
+  #if (! defined($rl_term)) { return undef; }
+  if (! defined($rl_term)) {
+    die "No usable Term::ReadLine::* modules found.\n" .
+	"This list tried: " . join(', ', @rl_modules) . "\n";
+  }
+
+  # I don't like readline ornaments in kpcli
+  $rl_term->ornaments(0);
+
+  # I'm not sure that these are only needed on Windows, but I know they
+  # are not needed on Linux so I'm trying to keep the scope narrow.
+  if (lc($OSNAME) =~ m/^mswin/ &&
+			$rl_term->ReadLine =~ m/Term::ReadLine::Perl5?/) {
+    # For Term::ReadLine::Perl and Term::ReadLine::Perl we set
+    # $readline::rl_scroll_nextline=0 on MS Windows.
+    if (defined($readline::rl_scroll_nextline)) {
+      $readline::rl_scroll_nextline=0;
+    }
+    if (defined($Term::ReadLine::Perl5::readline::rl_scroll_nextline)) {
+      $Term::ReadLine::Perl5::readline::rl_scroll_nextline=0;
+    }
+  }
+
+  # History
+  # The Term::ReadLine::Perl* modules shove values into the history
+  # file automtically. That causes two problems for kpcli:
+  # 1) Term::ShellUI calls $term->addhistory() itself for each CLI
+  #    command that it wants to store ih history (duplicates).
+  # 2) We use readline() in places like cli_new, cli_edit, etc. and
+  #    we do not want all those inputs in the history file (cruft).
+  if ($rl_term->ReadLine eq 'Term::ReadLine::Perl') {
+    no strict 'refs';
+    *readline::add_line_to_history = sub { return undef; };
+  }
+  if ($rl_term->ReadLine eq 'Term::ReadLine::Perl5') {
+    no strict 'refs';
+    *Term::ReadLine::Perl5::readline::add_line_to_history = sub {return undef;}
+  }
+
+  if (defined($hold_TERM)) { $ENV{'TERM'} = $hold_TERM; }
+
+  return $rl_term;
+}
+
+# Use simple magic recipes to identify relevant file types
+sub magic_file_type($) {
+  my $filename = shift @_;
+  my $fh=new FileHandle;
+  my $header='';
+  if (open($fh, '<', $filename)) {
+    my $n = read $fh, $header, 4;
+    close $fh;
+  }
+  # KeePass
+  # Recipe from https://github.com/glensc/file/blob/master/magic/Magdir/keepass
+  # 0       lelong            0x9AA2D903      Keepass password database
+  # >4       lelong            0xB54BFB65      1.x KDB
+  # >>48       lelong            >0              \b, %d groups
+  # >>52       lelong            >0              \b, %d entries
+  # >>8       lelong&0x0f    1              \b, SHA-256
+  # >>8       lelong&0x0f    2              \b, AES
+  # >>8       lelong&0x0f    4              \b, RC4
+  # >>8       lelong&0x0f    8              \b, Twofish
+  # >>120       lelong            >0          \b, %d key transformation rounds
+  # >4       lelong            0xB54BFB67      2.x KDBX
+  if ($header =~ m/^\x03\xd9\xa2\x9a/) {
+    return 'keepass';
+  }
+  # Password Safe v3
+  # Recipe from https://github.com/glensc/file/blob/master/magic/Magdir/pwsafe
+  if ($header =~ m/^PWS3/) {
+    return 'pws3';
+  }
+  return undef;
+}
+
 ########################################################################
 # Unix-style, "touch" a file
 ########################################################################
@@ -2917,7 +3248,6 @@ return($retval);
 
 kpcli - A command line interface to KeePass database files.
 
-
 =head1 DESCRIPTION
 
 A command line interface (interactive shell) to work with KeePass
@@ -2932,7 +3262,7 @@ Please run the program and type "help" to learn how to use it.
 
 =head1 PREREQUISITES
 
-This script requires these non-core modules:
+This program requires these non-core modules:
 
 C<Crypt::Rijndael> - libcrypt-rijndael-perl on Ubuntu 10.04
 
@@ -2944,9 +3274,10 @@ C<File::KeePass>   - libfile-keepass-perl on Ubuntu 12.04
 
 C<Term::ShellUI>   - libterm-shellui-perl on Ubuntu 12.10
 
-It is also recommended that you install C<Term::ReadLine::Gnu> which will
-give you command history and tab completion functionality. That module is
-in the libterm-readline-gnu-perl package on Ubuntu.
+It is recommended that you install C<Term::ReadLine::Gnu> which will
+provide more fluid signal handling on Unix-like systems, making kpcli
+robust to suspend, resume, and interupt - SIGSTP, SIGCONT and SIGINT.
+That module is in the libterm-readline-gnu-perl package on Ubuntu.
 
 You can optionally install C<Clipboard> and C<Tiny::Capture> to use the
 clipboard features; http://search.cpan.org/~king/Clipboard/ and
@@ -2954,6 +3285,12 @@ libcapture-tiny-perl on Ubuntu 10.04.
 
 You can optionally install C<Data::Password> to use the pwck feature
 (Password Quality Check); libdata-password-perl on Ubuntu 10.04.
+
+On MS Windows, you can optionally install C<Win32::Console::ANSI> to get
+ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
+for the kpcli port to Windows and, using cpanminus, one can install all
+of kpcli's dependencies, sans Term::ReadLine::Gnu which is optional for
+kpcli and not supported on MS Windows.
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
@@ -3004,123 +3341,146 @@ this program would not have been practical for me to author.
 
 =head1 CHANGELOG
 
- 2010-Nov-28 - v0.1 - Initial release.
- 2010-Nov-28 - v0.2 - Encrypt the master password in RAM.
- 2010-Nov-29 - v0.3 - Fixed master password encryption for saveas.
- 2010-Nov-29 - v0.4 - Fixed code to work w/out Term::ReadLine::Gnu.
-                      Documented File::KeePass v0.1 hierarchy bug.
- 2010-Nov-29 - v0.5 - Made find command case insensitive.
-                      Bugfix in new command (path regex problem).
- 2010-Nov-29 - v0.6 - Added lock file support; warn if a lock exists.
- 2010-Dec-01 - v0.7 - Further documented the group fields that are
-                       dropped, in the CAVEATS section of the POD.
-                      Sort group and entry titles naturally.
- 2010-Dec-23 - v0.8 - Worked with File::KeePass author to fix a couple
-                       of bugs and then required >=v0.03 of that module.
-                      Sorted "/_found" to last in the root group list.
-                      Fixed a "database changed" state bug in cli_save().
-                      Made the find command ignore entries in /Backup/.
-                      Find now offers show when only one entry is found.
-                      Provided a patch to Term::ShellUI author to add
-                       eof_exit_hook and added support for it to kpcli.
- 2011-Feb-19 - v0.9 - Fixed bugs related to spaces in group names as
-                       reported in SourceForge bug number 3132258.
-                      The edit command now prompts to save on changes.
-                      Put scrub_unknown_values_from_all_groups() calls
-                       back into place after realizing that v0.03 of
-                      File::KeePass did not resolve all of the problems.
- 2011-Apr-23 - v1.0 - Changed a perl 5.10+ regex to a backward-compatable
-                       one to resolve SourceForge bug number 3192413.
-                      Modified the way that the /Backup group is ignored
-                       by the find command to stop kpcli from croaking on
-                       multiple entries with the same name in that group.
-                       - Note: There is a more general bug here that
-                               needs addressing (see BUGS section).
-                      An empty title on new entry aborts the new entry.
-                      Changed kdb files are now detected/warned about.
-                      Tested against Term::ShellUI v0.9, which has my EOF
-                       hook patch, and updated kpcli comments about it.
-                      Term::ShellUI's complete_history() method was
-                       removed between v0.86 and v0.9 and so I removed
-                       kpli's call to it (Ctrl-r works for history).
-                      Added the "icons" command.
- 2011-Sep-07 - v1.1 - Empty DBs are now initialized to KeePassX style.
-                      Fixed a couple of bugs in the find command.
-                      Fixed a password noecho bug in the saveas command.
-                      Fixed a kdb_has_changed bug in the saveas command.
-                      Fixed a cli_open bug where it wasn't cli_close'ing.
-                      Fixed variable init bugs in put_master_passwd().
-                      Fixed a false warning in warn_if_file_changed().
- 2011-Sep-30 - v1.2 - Added the "export" command.
-                      Added the "import" command.
-                      Command "rmdir" asks then deletes non-empty groups.
-                      Command "new" can auto-generate random passwords.
- 2012-Mar-03 - v1.3 - Fixed bug in cl command as reported in SourceForge
-                       bug number 3496544.
- 2012-Apr-17 - v1.4 - Added key file support based on a user contributed
-                       patch with SourceForge ID# 3518388.
-                      Added my_help_call() to allow for longer and more
-                       descriptive command summaries (for help command).
-                      Stopped allowing empty passwords for export.
- 2012-Oct-13 - v1.5 - Fixed "help <foo>" commands, that I broke in v1.4.
-                      Command "edit" can auto-generate random passwords.
-                      Added the "cls" and "clear" commands from a patch
-                       with SourceForge ID# 3573930.
-                      Tested compatibility with File::KeePass v2.03 and
-                       made minor changes that are possible with >=2.01.
-                      With File::KeePass v2.03, kpcli should now support
-                       KeePass v2 files (*.kdbx).
- 2012-Nov-25 - v1.6 - Hide passwords (red on red) in the show command
-                       unless the -f option is given.
-                      Added the --readonly command line option.
-                      Added support for multi-line notes/comments;
-                       input ends on a line holding a single ".".
- 2013-Apr-25 - v1.7 - Patched to use native File::KeePass support for key
-                       files, if the File::KeePass version is new enough.
-                      Added the "version" and "ver" commands.
-                      Updated documentation as Ubuntu 12.10 now packages
-                       all of kpcli's dependencies.
-                      Added --histfile command line option.
-                      Record modified times on edited records, from a
-                       patch with SourceForge ID# 3611713.
-                      Added the -a option to the show command.
- 2013-Jun-09 - v2.0 - Removed the unused Clone module after a report that
-                       Clone is no longer in core Perl as of v5.18.0.
-                      Added the stats and pwck commands.
-                      Added clipboard commands (xw/xu/xp/xx).
-                      Fixed some long-standing tab completion bugs.
-                      Warn if multiple groups or entries are titled the
-                       same within a group, except for /Backup entries.
- 2013-Jun-10 - v2.1 - Fixed several more tab completion bugs, and they
-                       were serious enough to warrant a quick release.
- 2013-Jun-16 - v2.2 - Trap and handle SIGINT (^C presses).
-                      Trap and handle SIGTSTP (^Z presses).
-                      Trap and handle SIGCONT (continues after ^Z).
-                      Stopped printing found dictionary words in pwck.
- 2013-Jul-01 - v2.3 - More readline() and signal handling improvements.
-                      Title conflict checks in cli_new()/edit()/mv().
-                      Group title conflict checks in rename().
-                      cli_new() now accepts optional path&|title param.
-                      cli_ls() can now list multiple paths.
-                      cli_edit() now shows the "old" values for users
-                       to edit, if Term::ReadLine::Gnu is available.
-                      cli_edit() now aborts all changes on ^C.
-                      cli_saveas() now asks before overwriting a file.
+ 2010-Nov-28 v0.1 - Initial release.
+ 2010-Nov-28 v0.2 - Encrypt the master password in RAM.
+ 2010-Nov-29 v0.3 - Fixed master password encryption for saveas.
+ 2010-Nov-29 v0.4 - Fixed code to work w/out Term::ReadLine::Gnu.
+                    Documented File::KeePass v0.1 hierarchy bug.
+ 2010-Nov-29 v0.5 - Made find command case insensitive.
+                    Bugfix in new command (path regex problem).
+ 2010-Nov-29 v0.6 - Added lock file support; warn if a lock exists.
+ 2010-Dec-01 v0.7 - Further documented the group fields that are
+                     dropped, in the CAVEATS section of the POD.
+                    Sort group and entry titles naturally.
+ 2010-Dec-23 v0.8 - Worked with File::KeePass author to fix a couple
+                     of bugs and then required >=v0.03 of that module.
+                    Sorted "/_found" to last in the root group list.
+                    Fixed a "database changed" state bug in cli_save().
+                    Made the find command ignore entries in /Backup/.
+                    Find now offers show when only one entry is found.
+                    Provided a patch to Term::ShellUI author to add
+                     eof_exit_hook and added support for it to kpcli.
+ 2011-Feb-19 v0.9 - Fixed bugs related to spaces in group names as
+                     reported in SourceForge bug number 3132258.
+                    The edit command now prompts to save on changes.
+                    Put scrub_unknown_values_from_all_groups() calls
+                     back into place after realizing that v0.03 of
+                    File::KeePass did not resolve all of the problems.
+ 2011-Apr-23 v1.0 - Changed a perl 5.10+ regex to a backward-compatable
+                     one to resolve SourceForge bug number 3192413.
+                    Modified the way that the /Backup group is ignored
+                     by the find command to stop kpcli from croaking on
+                     multiple entries with the same name in that group.
+                     - Note: There is a more general bug here that
+                             needs addressing (see BUGS section).
+                    An empty title on new entry aborts the new entry.
+                    Changed kdb files are now detected/warned about.
+                    Tested against Term::ShellUI v0.9, which has my EOF
+                     hook patch, and updated kpcli comments about it.
+                    Term::ShellUI's complete_history() method was
+                     removed between v0.86 and v0.9 and so I removed
+                     kpli's call to it (Ctrl-r works for history).
+                    Added the "icons" command.
+ 2011-Sep-07 v1.1 - Empty DBs are now initialized to KeePassX style.
+                    Fixed a couple of bugs in the find command.
+                    Fixed a password noecho bug in the saveas command.
+                    Fixed a kdb_has_changed bug in the saveas command.
+                    Fixed a cli_open bug where it wasn't cli_close'ing.
+                    Fixed variable init bugs in put_master_passwd().
+                    Fixed a false warning in warn_if_file_changed().
+ 2011-Sep-30 v1.2 - Added the "export" command.
+                    Added the "import" command.
+                    Command "rmdir" asks then deletes non-empty groups.
+                    Command "new" can auto-generate random passwords.
+ 2012-Mar-03 v1.3 - Fixed bug in cl command as reported in SourceForge
+                     bug number 3496544.
+ 2012-Apr-17 v1.4 - Added key file support based on a user contributed
+                     patch with SourceForge ID# 3518388.
+                    Added my_help_call() to allow for longer and more
+                     descriptive command summaries (for help command).
+                    Stopped allowing empty passwords for export.
+ 2012-Oct-13 v1.5 - Fixed "help <foo>" commands, that I broke in v1.4.
+                    Command "edit" can auto-generate random passwords.
+                    Added the "cls" and "clear" commands from a patch
+                     with SourceForge ID# 3573930.
+                    Tested compatibility with File::KeePass v2.03 and
+                     made minor changes that are possible with >=2.01.
+                    With File::KeePass v2.03, kpcli should now support
+                     KeePass v2 files (*.kdbx).
+ 2012-Nov-25 v1.6 - Hide passwords (red on red) in the show command
+                     unless the -f option is given.
+                    Added the --readonly command line option.
+                    Added support for multi-line notes/comments;
+                     input ends on a line holding a single ".".
+ 2013-Apr-25 v1.7 - Patched to use native File::KeePass support for key
+                     files, if the File::KeePass version is new enough.
+                    Added the "version" and "ver" commands.
+                    Updated documentation as Ubuntu 12.10 now packages
+                     all of kpcli's dependencies.
+                    Added --histfile command line option.
+                    Record modified times on edited records, from a
+                     patch with SourceForge ID# 3611713.
+                    Added the -a option to the show command.
+ 2013-Jun-09 v2.0 - Removed the unused Clone module after a report that
+                     Clone is no longer in core Perl as of v5.18.0.
+                    Added the stats and pwck commands.
+                    Added clipboard commands (xw/xu/xp/xx).
+                    Fixed some long-standing tab completion bugs.
+                    Warn if multiple groups or entries are titled the
+                     same within a group, except for /Backup entries.
+ 2013-Jun-10 v2.1 - Fixed several more tab completion bugs, and they
+                     were serious enough to warrant a quick release.
+ 2013-Jun-16 v2.2 - Trap and handle SIGINT (^C presses).
+                    Trap and handle SIGTSTP (^Z presses).
+                    Trap and handle SIGCONT (continues after ^Z).
+                    Stopped printing found dictionary words in pwck.
+ 2013-Jul-01 v2.3 - More readline() and signal handling improvements.
+                    Title conflict checks in cli_new()/edit()/mv().
+                    Group title conflict checks in rename().
+                    cli_new() now accepts optional path&|title param.
+                    cli_ls() can now list multiple paths.
+                    cli_edit() now shows the "old" values for users
+                     to edit, if Term::ReadLine::Gnu is available.
+                    cli_edit() now aborts all changes on ^C.
+                    cli_saveas() now asks before overwriting a file.
+ 2013-Nov-26 v2.4 - Fixed several "perl -cw" warnings reported on
+                     2013-07-09 as SourceForge bug #9.
+                    Bug fix for the cl command, but in sub cli_ls().
+                    First pass at Strawberry perl/MS Windows support.
+                     - Enhanced support for Term::ReadLine::Perl
+                     - Added support for Term::ReadLine::Perl5
+                    Added display of expire time for show -a.
+                    Added -a option to the find command.
+                    Used the new magic_file_type() in a few places.
+                    Added generatePasswordFromDict() and "w" generation.
+                    Added the -v option to the version command.
+                     - Added the versions command.
 
 =head1 TODO ITEMS
 
   Consider http://search.cpan.org/~sherwin/Data-Password-passwdqc/
   for password quality checking.
 
+  Consider adding searches for expired entries and possibly also for
+  created, modified, and access times older than a user supplied time.
+
+  Consider adding import support for Password Safe v3 files using
+  http://search.cpan.org/~tlinden/Crypt-PWSafe3/. May have already
+  done this if the unpackaged dependencies list was not so long.
+
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
 =pod OSNAMES
 
-Unix-like (written and tested on Ubuntu Linux 10.04.1 LTS).
+Unix-like
+ - Written and tested on Ubuntu Linux 10.04.1 LTS.
+ - Known to work on many other Linux and *BSD distributions.
+
+Microsoft Windows
+ - As of v2.4, MS Windows is also supported.
+ - Tested and compiled on Strawberry Perl 5.16.2 on Windows 7.
 
 =pod SCRIPT CATEGORIES
 
-UNIX/System_administration
-
-=cut
+C<UNIX/System_administration>, C<Win32/Utilities>
 
