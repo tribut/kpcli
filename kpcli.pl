@@ -18,6 +18,7 @@
 # The required perl modules
 use strict;                                   # core
 use version;                                  # core
+use File::Spec;                               # core
 use FileHandle;                               # core
 use Getopt::Long;                             # core
 use File::Basename;                           # core
@@ -29,6 +30,8 @@ use Term::ANSIColor;                          # core
 use Carp qw(longmess);                        # core
 use English qw(-no_match_vars);               # core
 use Time::HiRes qw(gettimeofday tv_interval); # core
+use Time::Local qw(timegm);                   # core
+use Clone qw(clone);                          # core
 use POSIX;                   # core, required for unsafe signal handling
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
@@ -77,27 +80,33 @@ $|=1; # flush immediately after writes or prints to STDOUT
 my $DEBUG=0;
 $Data::Dumper::Useqq = 1;    # Have Dumper escape special chars (like \0)
 my $DEFAULT_PASSWD_LEN = 20; # Default length of generated passwords.
+my $DEFAULT_PASSWD_MIN = 1;  # Minimum length of generated passwords.
+my $DEFAULT_PASSWD_MAX = 50; # Maximum length of generated passwords.
 my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
 my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
+my $DEfAULT_BAKUP_ICON = 2;  # In keepassx, icon 2 is a warning sign
 my $FOUND_DIR = '_found';    # The find command's results go in /_found/
+my $MAX_ATTACH_SIZE = 2*1024**2; # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "2.5";
+my $VERSION = "2.7";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
 
 my $doc_passwd_gen =
-	"Usage is straightforward. For password generation, the\n" .
-	"\"g\" method produces a string of random characters while\n" .
-	"the \"w\" method creates a 4-word string inspired by\n" .
-	"\"correct horse battery staple\" (http://xkcd.com/936/).\n" .
+	"For password generation, the \"g\" method produces a\n" .
+	"string of random characters, the \"w\" method creates a\n" .
+	"4-word string inspired by \"correct horse battery staple\"\n" .
+	"(http://xkcd.com/936/), and the \"i\" method provides an\n" .
+	"interactive user interface to the \"g\" and \"w\" methods.\n" .
 	"\n" .
-	"By default, the \"g\" method generates a password that is\n" .
-	"$DEFAULT_PASSWD_LEN characters long. " .
+	"By default, the \"g\" and \"i\" methods generate passwords that\n" .
+	"are $DEFAULT_PASSWD_LEN characters long. " .
 				"That can be controlled by providing an\n" .
-	"integer immediately after the \"g\" in the range of 1-50.\n" .
+	"integer immediately after the \"g|i\" in the range of "
+        			. "$DEFAULT_PASSWD_MIN-$DEFAULT_PASSWD_MAX.\n" .
 	"For example, \"g17\" will generate a 17 character password.\n" .
 	"";
 # Setup our Term::ShellUI object
@@ -185,7 +194,7 @@ my $term = new Term::ShellUI(
              minargs => 1, maxargs => 2,
              args => [\&Term::ShellUI::complete_files,
 					\&Term::ShellUI::complete_files],
-             proc => \&cli_saveas,
+             proc => sub { run_no_TSTP(\&cli_saveas, @_); },
          },
          "export" => {
              desc => "Export entries to a new KeePass DB " .
@@ -201,7 +210,7 @@ my $term = new Term::ShellUI(
              minargs => 1, maxargs => 2,
              args => [\&Term::ShellUI::complete_files,
 					\&Term::ShellUI::complete_files],
-             proc => \&cli_export,
+             proc => sub { run_no_TSTP(\&cli_export, @_); },
          },
          "import" => {
              desc => "Import another KeePass DB " .
@@ -212,7 +221,7 @@ my $term = new Term::ShellUI(
              minargs => 2, maxargs => 3,
              args => [\&Term::ShellUI::complete_files,\&complete_groups,
 					\&Term::ShellUI::complete_files],
-             proc => \&cli_import,
+             proc => sub { run_no_TSTP(\&cli_import, @_); },
          },
          "open" => {
              desc => "Open a KeePass database file " .
@@ -220,7 +229,7 @@ my $term = new Term::ShellUI(
              minargs => 1, maxargs => 2,
              args => [\&Term::ShellUI::complete_files,
 					\&Term::ShellUI::complete_files],
-             proc => \&cli_open,
+             proc => sub { run_no_TSTP(\&cli_open, @_); },
          },
          "mkdir" => {
              desc => "Create a new group (mkdir <group_name>)",
@@ -234,8 +243,10 @@ my $term = new Term::ShellUI(
              args => \&complete_groups,
              method => \&cli_rmdir,
          },
+         "dir" => { alias => "ls", },
          "ls" => {
-             desc => "Lists entries in pwd or in the specified path",
+             desc => "Lists items in the pwd or a specified path " .
+							"(\"dir\" also works)",
              minargs => 0, maxargs => 99,
              args => \&complete_groups,
              method => \&cli_ls,
@@ -245,11 +256,13 @@ my $term = new Term::ShellUI(
              doc => "\n" .
 		"The new command is used to create a new entry.\n" .
 		"\n" .
+		"Usage is straightforward.\n" .
+		"\n" .
 		$doc_passwd_gen .
 		"",
              minargs => 0, maxargs => 1,
              args => [\&complete_groups],
-             method => \&cli_new,
+             method => sub { run_no_TSTP(\&cli_new, @_); },
          },
          "rm" => {
              desc => "Remove an entry: rm <path to entry|entry number>",
@@ -323,11 +336,23 @@ my $term = new Term::ShellUI(
              doc => "\n" .
 		"The edit command is used to modify an entry.\n" .
 		"\n" .
+		"Usage is straightforward.\n" .
+		"\n" .
 		$doc_passwd_gen .
 		"",
              minargs => 1, maxargs => 1,
              args => \&complete_groups_and_entries,
-             method => \&cli_edit,
+             method => sub { run_no_TSTP(\&cli_edit, @_); },
+         },
+         "attach" => {
+             desc => "Manage attachments: attach <path to entry|entry number>",
+             doc => "\n" .
+		"The attach command provided an interactive user interface\n" .
+		"for managing file attachments on an entry.\n" .
+		"",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => sub { run_no_TSTP(\&cli_attach, @_); },
          },
          "mv" => {
              desc => "Move an item: mv <path to group|entry> <path to group>",
@@ -358,17 +383,17 @@ my $term = new Term::ShellUI(
              minargs => 2, maxargs => 2,
              args => [\&complete_groups_and_entries,
 					\&complete_groups_and_entries],
-             method => \&cli_clone,
+             method => sub { run_no_TSTP(\&cli_clone, @_); },
          },
          "save" => {
              desc => "Save the database to disk",
              minargs => 0, maxargs => 0, args => "",
-             method => \&cli_save,
+             method => sub { run_no_TSTP(\&cli_save, @_); },
          },
          "close" => {
              desc => "Close the currently opened database",
              minargs => 0, maxargs => 0, args => "",
-             method => \&cli_close,
+             method => sub { run_no_TSTP(\&cli_close, @_); },
          },
          "find" => {
              desc => "Finds entries by Title",
@@ -376,7 +401,9 @@ my $term = new Term::ShellUI(
 		"Searches for entries with the given search term\n" .
 		"in their title and places matches into \"/$FOUND_DIR/\".\n" .
 		"\n" .
-		"Add -a to search data fields beyond just the title.\n",
+		"Add -a to search data fields beyond just the title.\n" .
+		"\n" .
+		"Use -expired to find expired entries.\n",
              minargs => 1, maxargs => 2, args => "<search string>",
              method => \&cli_find,
          },
@@ -386,11 +413,13 @@ my $term = new Term::ShellUI(
          },
          "icons" => {
              desc => "Change group or entry icons in the database",
-             maxargs => 0, proc => \&cli_icons,
+             maxargs => 0,
+             proc => sub { run_no_TSTP(\&cli_icons, @_); },
          },
          "quit" => {
              desc => "Quit this program (EOF and exit also work)",
-             maxargs => 0, method => \&cli_quit,
+             maxargs => 0,
+             method => sub { run_no_TSTP(\&cli_quit, @_); },
 	     exclude_from_history => 1,
          },
          "exit" => { alias => "quit", exclude_from_history => 1,}
@@ -469,7 +498,8 @@ sub open_kdb {
 
   # Look for lock file and warn if it is found
   my $lock_file = $file . '.lock'; # KeePassX style
-  if (-f $lock_file) {
+  if (-f $lock_file &&
+		! (defined($opts->{readonly}) && int($opts->{readonly})) ) {
     print color('bold yellow') .
 	"WARNING:" .
 	color('clear') . color('red') .
@@ -496,6 +526,7 @@ sub open_kdb {
 
   $state->{kdb_file} = $file;
   $state->{key_file} = $key_file;
+  $state->{kdb_ver} = $state->{kdb}->{header}->{version}; # will be 1 or 2
   $state->{put_master_passwd}($master_pass);
   $state->{kdb_has_changed}=0;
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -563,7 +594,10 @@ sub build_all_entry_paths {
     my @path_to_me = @{$root_path};
     push @path_to_me, $me->{title};
     if (defined($me->{entries})) {
-      foreach my $ent (@{$me->{entries}}) {
+      ENTRY: foreach my $ent (@{$me->{entries}}) {
+        if ($ent->{'title'} eq 'Meta-Info' && $ent->{'username'} eq 'SYSTEM') {
+          next ENTRY; # skip Meta-Info/SYSTEM entries
+        }
         my $path=join( "\0", (@path_to_me, $ent->{title}) );
         my $err_path = '/' . humanize_path($path);
         if ($ent->{title} eq '') {
@@ -648,6 +682,7 @@ sub get_groups_and_entries {
 
   my $k=$state->{kdb};
 
+  # Collect the @groups and entries
   my @groups=();
   my @entries=();
   my $norm_path = normalize_path_string($path);
@@ -663,6 +698,16 @@ sub get_groups_and_entries {
     @entries = $k->find_entries({group_id => $id});
   }
 
+  # Remove Meta-Info/SYSTEM entries
+  my @non_meta_info = ();
+  foreach my $ent (@entries) {
+    if (!($ent->{'title'} eq 'Meta-Info' && $ent->{'username'} eq 'SYSTEM')) {
+      push @non_meta_info, $ent;
+    }
+  }
+  @entries = @non_meta_info;
+
+  # Sort the results
   @groups = sort group_sort @groups;
   @entries = sort { ncmp($a->{title},$b->{title}); } @entries;
 
@@ -703,17 +748,29 @@ sub group_sort($$) {
     return 1;
   } elsif ($b->{title} eq 'Backup' && $b->{level} == 0) {
     return -1;
+  # "Recycle Bin" at level=0 is a special case (KeePass v2).
+  } elsif ($a->{title} eq 'Recycle Bin' && $a->{level} == 0) {
+    return 1;
+  } elsif ($b->{title} eq 'Recycle Bin' && $b->{level} == 0) {
+    return -1;
   # Sort everything else naturally (Sort::Naturally::ncmp).
   } else {
     return ncmp($a->{title},$b->{title}); # Natural sort
   }
-
-
 }
 
 # -------------------------------------------------------------------------
 # All of the cli_*() functions are below here
 # -------------------------------------------------------------------------
+
+# A simple wrapper function to block SIGTSTP (^Z) during certain commands
+sub run_no_TSTP {
+  my $func = shift @_;
+  $SIG{TSTP}='IGNORE';
+  my @retval = &$func(@_);
+  $SIG{TSTP}='DEFAULT';
+  return @retval;
+}
 
 # Checks passwords for their quality
 sub cli_pwck {
@@ -852,19 +909,39 @@ sub cli_stats {
     }
     # If the user hit ^C (SIGINT) then we need to stop
     if (recent_sigint()) {
-       print "\r"; # Need to return to column 0 of the output line
+       print " "x20 . "\r"; # Need to return to column 0 of the output line
        return 0;
     }
   }
 
-  print "KeePass file version: " . $k->{header}->{version} . "\n" .
+  my $t= " "x20 . "\r" .
+	"File: " . $state->{kdb_file} . "\n" .
+	"Key file: " .
+	(defined($state->{key_file}) ? $state->{key_file} : 'N/A') . "\n";
+  if (defined($k->{header}->{database_name})) {
+    $t.="Name: " . $k->{header}->{database_name} . "\n";
+  }
+  if (defined($k->{header}->{database_description})) {
+    my $desc = $k->{header}->{database_description};
+    $desc =~ s/[\r\n]/\n/g;
+    my @l = split(/\n/, $desc);
+    $t .= "Description:\n" . "| " . join("\n| ", @l) . "\n";
+  }
+  $t .= "KeePass file version: " . $k->{header}->{version} . "\n" .
 	"Encryption type:      " . $k->{header}->{enc_type} . "\n" .
-	"Encryption rounds:    " . $k->{header}->{rounds} . "\n" .
-	"Number of groups:     $stats{group_count}\n" .
+	"Encryption rounds:    " . $k->{header}->{rounds} . "\n";
+  if (defined($k->{header}->{cipher})) {
+    $t.="Cipher:               $stats{cipher}\n";
+  }
+  if (defined($k->{header}->{compression})) {
+    $t.="Compression:          $stats{compression}\n";
+  }
+  $t .= "Number of groups:     $stats{group_count}\n" .
 	"Number of entries:    $stats{entry_count}\n" .
 	"Entries with passwords of length:\n".stats_print(\%password_lengths) .
 	"\n" .
 	"";
+  print $t;
 }
 
 sub cli_cls {
@@ -959,6 +1036,54 @@ sub cli_cd_helper($$) {
   }
 }
 
+# Return 1 if entry's password never expires, else 0.
+# Helps support both v1 (*.kdb) and v2 (*.kdbx) files.
+sub does_expire_never {
+  my $kdb_ver = shift @_;
+  my $ent = shift @_;
+  my $expires = $ent->{expires};
+  if ($kdb_ver == 1 && $expires =~ m/^(\d{4})-/ && ($1 == 2999)) {
+    return 1;
+  } elsif ($kdb_ver == 2 && (! $ent->{expires_enabled})) {
+    return 1;
+  }
+  return 0;
+}
+
+# Helper function of cli_find() to find expired entries.
+sub find_expired_entries {
+  my $kdb_ver = shift @_;
+  my $k = shift @_;
+  our $state;
+
+  my @expired = ();
+  my @all_entries_flattened = $k->find_entries({});
+  ENT: foreach my $ent (@all_entries_flattened) {
+    if (recent_sigint()) { return (); } # Bail on SIGINT
+    # If we don't have this entry recorded in all_ent_paths_rev then
+    # we can't report on it. The only case known of is when we have
+    # multiple entries at the same level (unsupported) and typically
+    # that's only seen in /Backup in v1 databases.
+    if (! defined($state->{all_ent_paths_rev}->{$ent->{id}})) {
+      next ENT;
+    }
+    # Now test the expired time...
+    if (does_expire_never($kdb_ver, $ent)) { next ENT; }
+    my $exp = $ent->{expires};
+    my $title = $ent->{title};
+    if ($exp !~ m/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/) {
+      print "Warning: Invalid expiration date found in \"$title\"\n";
+      next ENT;
+    }
+    my ($year,$mon,$mday,$hour,$min,$sec) = ($1, $2, $3, $4, $5, $6);
+    my $timegm = timegm($sec,$min,$hour,$mday,$mon-1,$year);
+    if ($timegm < time) {
+      push @expired, $ent;
+    }
+  }
+  return @expired;
+}
+
 sub cli_find($) {
   my $self = shift @_;
   my $params = shift @_;
@@ -974,42 +1099,65 @@ sub cli_find($) {
   my %opts=();
   {
     local @ARGV = @{$params->{args}};
-    my $result = &GetOptions(\%opts, 'f', 'a');
-    if (scalar(@ARGV) != 1) {
-      return -1;
-    }
-    $search_str = $ARGV[0];
-  }
-
-
-  # Now do the search
-  my $k=$state->{kdb};
-  print "Searching for \"$search_str\" ...\n";
-
-  # Make $search_str a case-insensitive regex
-  my @letters=split(//, $search_str);
-  foreach my $l (@letters) {
-    if (uc($l) ne lc($l)) {
-      $l='[' . uc($l) . lc($l) . ']';
+    my $result = &GetOptions(\%opts, 'a', 'expired');
+    if (defined($opts{'expired'})) {
+      if (scalar(@ARGV) || scalar(keys(%opts)) > 1) {
+        print "-expired cannot have search criteria other qualifiers.\n";
+        return;
+      }
+    } else {
+      if (scalar(@ARGV) != 1) {
+        print "Find only supports searching for one word.\n";
+        return;
+      }
+      $search_str = $ARGV[0];
     }
   }
-  $search_str=join('', @letters);
 
-  my @srch_flds = qw(title);
-  if ($opts{'a'}) {
-    @srch_flds = qw(title username comment url);
-  }
   my @e = ();
-  foreach my $fld (@srch_flds) {
-    # Search entries by title, skipping the KeePassX /Backup group if it exists
-    my $search_params = { "$fld =~" => $search_str };
-    my $backup_dir_normalized=normalize_path_string("/Backup"); # /Backup
-    if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
-      $search_params->{'group_id !'} =
-		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
+  my $k=$state->{kdb};
+
+  if (length($search_str)) {
+    print "Searching for \"$search_str\" ...\n";
+
+    # Make $search_str a case-insensitive regex
+    my @letters=split(//, $search_str);
+    foreach my $l (@letters) {
+      if (uc($l) ne lc($l)) {
+        $l='[' . uc($l) . lc($l) . ']';
+      }
     }
-    push @e, $k->find_entries($search_params);
+    $search_str=join('', @letters);
+
+    my @srch_flds = qw(title);
+    if ($opts{'a'}) {
+      @srch_flds = qw(title username comment url tags);
+    }
+    foreach my $fld (@srch_flds) {
+      # Search entries by title, skipping the /Backup (*.kdb) and/or
+      # "/Recycle Bin" groups if they exists
+      my $search_params = { "$fld =~" => $search_str };
+      foreach my $bu_dir ('/Backup','/Recycle Bin') {
+        my $backup_dir_normalized=normalize_path_string($bu_dir);
+        if (defined($state->{all_grp_paths_fwd}->{$backup_dir_normalized})) {
+          $search_params->{'group_id !'} =
+		$state->{all_grp_paths_fwd}->{$backup_dir_normalized};
+        }
+      }
+      push @e, $k->find_entries($search_params);
+    }
+  } elsif (defined($opts{'expired'})) {
+    @e = find_expired_entries($state->{kdb_ver}, $k);
   }
+
+  # Remove Meta-Info/SYSTEM entries
+  my @non_meta_info = ();
+  foreach my $ent (@e) {
+    if (!($ent->{'title'} eq 'Meta-Info' && $ent->{'username'} eq 'SYSTEM')) {
+      push @non_meta_info, $ent;
+    }
+  }
+  @e = @non_meta_info;
 
   if ( scalar(@e) < 1) {
     print "No matches.\n";
@@ -1023,7 +1171,7 @@ sub cli_find($) {
   my @matches=();
   my %duplicates=();
   FINDS: foreach my $ent (@e) {
-    my %new_ent = %{$ent}; # Clone the entity
+    my %new_ent = %{clone($ent)}; # Clone the entity
     $new_ent{id} = int(rand(1000000000000000)); # A random new id
     $new_ent{group} = $found_gid; # Place this entry clone into /_found
     # $new_ent{path} is _NOT_ a normal key for File::KeePass but this is
@@ -1060,7 +1208,12 @@ sub cli_find($) {
       my $search_params = { 'group_id =' => $found_gid };
       my ($e,@empty) = $k->find_entries($search_params);
       my $full_path="/$FOUND_DIR/" . $e->{title};
-      cli_show($self, { args => [ $full_path ] });
+      my $show_args = [ $full_path ];
+      # If we are doing an expired password search, find only one entry,
+      # and give the user the option to show it, we want to show the
+      # expired time, and so we add -a here.
+      if (defined($opts{'expired'})) { push @{$show_args}, '-a'; }
+      cli_show($self, { args => $show_args });
     }
   }
 }
@@ -1252,9 +1405,15 @@ sub cli_rm($) {
     return -1;
   }
 
-  my $ent_id=$ent->{id};
-  $state->{kdb}->delete_entry({ id => $ent_id });
+  # Recycle the entry unless --no-recycle
+  if (! (defined($opts->{'no-recycle'}) && int($opts->{'no-recycle'}))) {
+    my $errmsg = recycle_entry($state, $ent);
+    if (defined($errmsg)) { print "WARNING: $errmsg\n"; }
+  }
+
+  $state->{kdb}->delete_entry({ id => $ent->{id} });
   $state->{kdb_has_changed}=1;
+  refresh_state_all_paths();
   RequestSaveOnDBChange();
 }
 
@@ -1427,7 +1586,7 @@ sub cli_mv($$) {
     # Unlock the kdb, clone the entry, remove its ID and set its new group,
     # add it to the kdb, delete the old entry, then lock the kdb...
     $state->{kdb}->unlock;
-    my %ent_copy = %{$ent};
+    my %ent_copy = %{clone($ent)}; # Clone the entity
     delete $ent_copy{id};
     $ent_copy{group} = $grp;
     if ($state->{kdb}->add_entry(\%ent_copy)) {
@@ -1487,7 +1646,7 @@ sub cli_copy {
   # Unlock the kdb, clone the entry, remove its ID and set its new group,
   # add it to the kdb, delete the old entry, then lock the kdb...
   $state->{kdb}->unlock;
-  my %ent_copy = %{$src_ent};
+  my %ent_copy = %{clone($src_ent)}; # Clone the entity
   $state->{kdb}->lock;
   delete $ent_copy{id}; # Remove the entry ID for the new copy
   my ($grp_path,$name)=normalize_and_split_raw_path($target_ent);
@@ -1600,6 +1759,7 @@ sub cli_show($$) {
   if (! defined($opts{f})) {
     $password = colored(['red on_red'], $password);
   }
+  # Print the entry for the user
   print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
@@ -1607,17 +1767,75 @@ sub cli_show($$) {
 	show_format("URL",$ent->{url}) . "\n" .
 	show_format("Notes",$ent->{comment}) . "\n" .
 	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '');
+  # Tags were added to KeePass in v2.11 (*.kdbx)
+  if (defined($ent->{tags}) && length($ent->{tags})) {
+    print show_format("Tags", humanize_entry_tags($ent->{tags})) . "\n";
+  }
+  # Check for strings and file attachments in this entry
+  foreach my $key (qw(strings binary)) {
+    my $attachment = show_helper_files_strings($ent,{f=>1},$key);
+    #my $attachment = show_helper_files_strings($ent, \%opts, $key);
+    if (length($attachment)) { print $attachment; }
+  }
+  # If -a was given, tack on those details
   if (defined($opts{a})) {
     print
 	show_format("Icon#",$ent->{icon}) . "\n" .
 	show_format("Creat",$ent->{created}) . "\n" .
 	show_format("Modif",$ent->{modified}) . "\n";
     if (defined($ent->{expires})) {
-      print show_format("Xpire",$ent->{expires}) . "\n";
+      my $expires = $ent->{expires};
+      if (does_expire_never($state->{kdb_ver}, $ent)) {
+        $expires = 'Never';
+      }
+      print show_format("Xpire",$expires) . "\n";
     }
   }
   print "\n";
   print &Dumper($ent) . "\n" if ($DEBUG > 2);
+}
+
+# A helper function to display key/val pairs and file attachments.
+# Note that strings (key/val pairs) and multiple attachments per
+# entry only exist in KeePass 2.x (kdbx) files, while verions 1.x
+# files (kdb) support only a single file attachment per entry.
+sub show_helper_files_strings {
+  my $ent = shift @_;
+  my $opts = shift @_;
+  my $key = shift @_;
+  my $labels = {
+	'binary' =>  ['Atchm','File Attachments'],
+	'strings' => ['Strgs','String Values'],
+	};
+  my @atts=();
+  if (defined($ent->{$key})) {
+    foreach my $name (sort keys %{$ent->{$key}}) {
+      if ($key eq 'binary') {
+        push @atts, "$name (". int(length($ent->{$key}->{$name})) ." bytes)";
+      } elsif ($key eq 'strings') {
+        if (defined($opts->{f})) {
+          push @atts, "$name = " . $ent->{$key}->{$name};
+        } else {
+          push @atts, "$name = ".colored(['red on_red'],$ent->{$key}->{$name});
+        }
+      }
+    }
+  }
+  my $attachment = '';
+  my $label = $labels->{$key}[0];
+  if (scalar(@atts) == 0 && defined($opts->{v})) {
+    $attachment = "None";
+  } elsif (scalar(@atts) == 1) {
+    $attachment = $atts[0];
+  } elsif (scalar(@atts) > 1) {
+    $label = $labels->{$key}[1];
+    my @t=();
+    foreach my $num (1..scalar(@atts)) {
+      push(@t, sprintf("%2d) %s", $num, $atts[$num-1]));
+    }
+    $attachment = "\n " . join("\n ", @t) . "\n";
+  }
+  return ($attachment ne '' ? show_format($label,$attachment) . "\n" : '');
 }
 
 sub cli_edit {
@@ -1637,10 +1855,16 @@ sub cli_edit {
   }
 
   my %changes = ();
-  my $retval = _entry_edit_gui($ent, \%changes);
+  my $retval = _entry_edit_gui($ent, \%changes, $state->{kdb_ver});
 
   # If the user made changes, apply them, update modify time and prompt to save
   if ($retval == 0 && scalar(keys(%changes)) > 0) {
+    # Recycle the entry unless --no-recycle
+    if (! (defined($opts->{'no-recycle'}) && int($opts->{'no-recycle'}))) {
+      my $errmsg = recycle_entry($state, $ent);
+      if (defined($errmsg)) { print "WARNING: $errmsg\n"; }
+    }
+    # Update the entry's changed fields
     $state->{kdb}->unlock; # Required for the password field
     foreach my $key (keys %changes) { $ent->{$key} = $changes{$key}; }
     $state->{kdb}->lock;
@@ -1653,21 +1877,88 @@ sub cli_edit {
 return 0;
 }
 
+# A routine to copy entries to the /Backup or "/Recycle Bin" folders.
+# Used by cli_edit, cli_rm, etc.
+sub recycle_entry {
+  my $state = shift @_;
+  my $ent = shift @_;
+  my $bugrp_id = get_recycle_group_path($state, 1);
+  if (defined($bugrp_id)) {
+    $state->{kdb}->unlock; # Required for the password field
+    my $tmp_ent = clone($ent); # Clone the entity and back it up
+    delete $tmp_ent->{id};
+    # Append the modified time to the title for the backup dir
+    $tmp_ent->{title} = $tmp_ent->{title} . " (". $tmp_ent->{modified} .")";
+    $tmp_ent->{group} = $bugrp_id;
+    $tmp_ent->{modified} = $state->{kdb}->now;
+    my $add_result = $state->{kdb}->add_entry($tmp_ent);
+    $state->{kdb}->lock;
+    if (! $add_result) {
+      return "Failed to copy the entry to the backup folder.";
+    } else {
+      $state->{kdb_has_changed}=1;
+    }
+    refresh_state_all_paths();
+  }
+  return undef;
+}
+
+# Returns /Backup or "/Recycle Bin" based on KeePass v1 or v2 file.
+# Creates the group if it is missing and $create_if_missing in true.
+sub get_recycle_group_path {
+  my $state = shift @_;
+  my $create_if_missing = shift @_ || 0;
+  my $bugrp = "/Backup"; # Default to v1 (is this correct?)
+  if ($state->{kdb_ver} == 2) {
+    $bugrp = "/Recycle Bin";
+  }
+  my $grp_path = normalize_path_string($bugrp);
+  if ($create_if_missing) {
+    if (! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
+      my $group = $state->{kdb}->add_group({
+        title => $grp_path,
+        icon => $DEfAULT_BAKUP_ICON,
+      }); # root level group
+      refresh_state_all_paths();
+      $state->{kdb_has_changed}=1;
+    }
+  }
+  if (! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
+    return undef;
+  }
+  return $state->{all_grp_paths_fwd}->{$grp_path};
+}
+
 # Helper function for cli_edit() and cli_clone()
-sub _entry_edit_gui($) {
+sub _entry_edit_gui($$$) {
   my $ent=shift @_;
   my $rChanges = shift @_;
+  my $kdb_ver = shift @_;
   # Loop through the fields taking edits the user wants to make
-  my @fields = get_entry_fields();
+  my @fields = get_entry_fields($kdb_ver);
   foreach my $input (@fields) {
+    my $current_val = $ent->{$input->{key}};
     my $val = '';
-    if ($input->{multiline}) {
-      $val = new_edit_multiline_input($input, $ent->{$input->{key}});
+    if (defined($input->{user_prep_func})) {
+      $current_val = $input->{user_prep_func}($current_val);
+    }
+    if (defined($input->{user_edit_func})) {
+      $val = $input->{user_edit_func}($ent, $input, $current_val);
+    } elsif ($input->{multiline}) {
+      $val = new_edit_multiline_input($input, $current_val);
     } else {
-      $val = new_edit_single_line_input($input, $ent->{$input->{key}});
+      $val = new_edit_single_line_input($input, $current_val);
     }
     # If the user hit ^C (SIGINT) then we need to stop
     if (recent_sigint()) { return -1; }
+    # Call the validate_func if it's defined
+    if (defined($input->{validate_func}) && length($val)) {
+      # Note that $val can be modified by the validate_func
+      if ($input->{validate_func}(\$val) != 0) {
+        print "Invalid $input->{txt} input.\n";
+        return -1;
+      }
+    }
     # Check a new title for same-name conflicts in its group
     if ($input->{key} eq 'title' && length($val)) {
       if ($val =~ m/\//) {
@@ -1718,6 +2009,101 @@ sub get_prepped_readline_term() {
   return $term;
 }
 
+# A helper function to interactively edit an entry's strings
+sub edit_entry_strings {
+  my $ent = shift @_;
+  my $input = shift @_;
+  my $initial_value = shift @_;
+  our $state;
+
+  my $tmp_ent = clone($ent); # Clone the entity
+  EDIT_INTERFACE: while (1) {
+    my @strings_keys = ();
+    if (defined($tmp_ent->{strings}) && ref($tmp_ent->{strings}) eq 'HASH') {
+      @strings_keys = sort keys %{$tmp_ent->{strings}};
+    }
+    my $strings_count = scalar(@strings_keys);
+    my $t='';
+    my $prompt = "Strings";
+    if ($strings_count > 0) {
+      $t .= show_helper_files_strings($tmp_ent,{f=>1,v=>1},'strings');
+      $prompt = "Choose";
+    }
+    $t .= "$prompt: (a)dd/(e)dit/(d)elete/(c)ancel/(F)inish? ";
+    print "$t";
+    COMMAND: while (my $key=get_single_key()) {
+      if (lc($key) eq 'c' || ord($key) == 3) { # Cancel or ^C
+        print "\n";
+        return ''; # We are to return nothing on no change
+      } elsif ($key =~ m/^[fF\r\n]$/) { # Finished (save)
+        print "\n";
+        return $tmp_ent->{strings};
+      } elsif (lc($key) eq 'd') {
+        if (defined($tmp_ent->{strings}) &&
+					ref($tmp_ent->{strings}) eq 'HASH') {
+          if ($strings_count < 2) {
+            %{$tmp_ent->{strings}} = ();
+          } else {
+            print "\r". " "x60 ."\rWhich entry number do you want to delete? ";
+            my $choice = get_single_line();
+            if ($choice !~ m/^\d+$/ || $choice<1 || $choice > $strings_count) {
+              print "\nInvalid number.";
+            } else {
+              delete($tmp_ent->{strings}->{$strings_keys[$choice-1]});
+            }
+          }
+          print "\n";
+          next EDIT_INTERFACE;
+        }
+      } elsif (lc($key) =~ m/^[ae]$/) {
+        my $iv='';
+        my $fld_being_edited = undef;
+        if (lc($key) eq 'e') {
+          print "\r". " "x60 ."\rWhich entry number do you want to edit? ";
+          my $choice = get_single_line();
+          if ($choice !~ m/^\d+$/ || $choice<1 || $choice > $strings_count) {
+            print "\nInvalid number.";
+            print "\n";
+            next EDIT_INTERFACE;
+          }
+          $fld_being_edited = $strings_keys[$choice-1];
+          my $val_being_edited = $tmp_ent->{strings}->{$fld_being_edited};
+          $iv = "$fld_being_edited = $val_being_edited";
+        }
+        my $prompt = "Input a key=value pair: ";
+        print "\r". " "x60 ."\r";
+        my $term = get_prepped_readline_term();
+        my $keyval = $term->readline($prompt, $iv);
+        #my $keyval = get_single_line();
+        if ($keyval =~ m/^\s*([^=]+?)\s*=\s*(.+?)\s*$/) {
+          my ($fld, $val) = ($1, $2);
+          if (!(defined($tmp_ent->{strings})) &&
+					ref($tmp_ent->{strings}) eq 'HASH') {
+            $tmp_ent->{strings} = {};
+          }
+          if (defined($tmp_ent->{strings}->{$fld}) &&
+			(lc($key) eq 'a' || $fld ne $fld_being_edited)) {
+            print "\nString field \"$fld\" already exists in the entry.";
+          } else {
+            $tmp_ent->{strings}->{$fld}=$val;
+            if (defined($fld_being_edited) && $fld ne $fld_being_edited) {
+              delete($tmp_ent->{strings}->{$fld_being_edited});
+            }
+          }
+        } else {
+          print "\nInvalid entry.";
+        }
+        print "\n";
+        next EDIT_INTERFACE;
+      } else {
+        # Do nothing on invalid input
+        next COMMAND;
+      }
+    }
+  }
+
+  return $initial_value;
+}
 # Single line input helper function for cli_new and cli_edit.
 sub new_edit_single_line_input($$) {
   my $input = shift @_;
@@ -1726,42 +2112,62 @@ sub new_edit_single_line_input($$) {
 
   my $iv = ''; if (! $input->{hide_entry}) { $iv = $initial_value; }
   my $term = get_prepped_readline_term();
-  if ($input->{genpasswd}) {
-    print " "x25 . '("g" or "w" to generate a password)' . "\r";
-  }
-  my $prompt=$input->{txt} . ': ';
   my $val = '';
-  if ($input->{hide_entry}) {
-    $val = GetPassword($prompt, '');
-  } else {
-    $val = $term->readline($prompt, $iv);
-  }
-  chomp $val;
-  if ($input->{genpasswd} && $val =~ m/^([wg])(\d*)$/) {
-    my $cmd = $1;
-    my $len = $2;
-    if ($cmd eq 'g') {
-      if ($len !~ m/^\d+$/ || $len < 1 || $len > 50) {
-        $len = $DEFAULT_PASSWD_LEN;
-      }
-      $val = generatePasswordGobbledygook($len);
-    } else {
-      $val = generatePassword();
+
+  PASSWD_COLLECTION: {
+    if ($input->{genpasswd}) {
+      print " "x25 .'("g" or "w" to auto-generate, "i" for interactive)'. "\r";
     }
-  } elsif (length($val) && $input->{double_entry_verify}) {
-    my $prompt = "Retype to verify: ";
-    my $checkval = '';
+    my $prompt=$input->{txt} . ': ';
     if ($input->{hide_entry}) {
-      $checkval = GetPassword($prompt, '');
+      $val = GetPassword($prompt, '');
     } else {
-      $checkval = $term->readline($prompt);
+      $val = $term->readline($prompt, $iv);
     }
-    # If the user hit ^C (SIGINT) then we need to stop
-    if (recent_sigint()) { return undef; }
-    chomp $checkval;
-    if ($checkval ne $val) {
-      print "Entries mismatched. Please try again.\n";
-      redo;
+    chomp $val;
+    if ($input->{genpasswd} && $val =~ m/^([wgi])(\d*)$/) {
+      my $cmd = $1;
+      my $len = $2;
+      if ($cmd eq 'g' || $cmd eq 'i') {
+        if (!$len) {
+          $len = $DEFAULT_PASSWD_LEN;
+        } elsif ($len !~ m/^\d+$/ ||
+		$len < $DEFAULT_PASSWD_MIN || $len > $DEFAULT_PASSWD_MAX) {
+          $len = $DEFAULT_PASSWD_LEN;
+          print color('yellow')
+              . "Password length out of bounds, reset to $len chars.\n"
+              . color('clear');
+        }
+        if ($cmd eq 'g') {
+          $val = generatePasswordGobbledygook($len);
+        } elsif ($cmd eq 'i') {
+          $val = generatePasswordInteractive($len);
+          # Interactive canceled by user
+          if (! defined($val)) {
+            print "\n";
+            redo PASSWD_COLLECTION;
+          }
+        }
+      } elsif ($cmd eq 'w') {
+        $val = generatePassword();
+      } else {
+        die "BUG: it should be impossible to get to this code!\n";
+      }
+    } elsif (length($val) && $input->{double_entry_verify}) {
+      my $prompt = "Retype to verify: ";
+      my $checkval = '';
+      if ($input->{hide_entry}) {
+        $checkval = GetPassword($prompt, '');
+      } else {
+        $checkval = $term->readline($prompt);
+      }
+      # If the user hit ^C (SIGINT) then we need to stop
+      if (recent_sigint()) { return undef; }
+      chomp $checkval;
+      if ($checkval ne $val) {
+        print "Entries mismatched. Please try again.\n";
+        redo PASSWD_COLLECTION;
+      }
     }
   }
   # We are done with readline calls so let's cleanup.
@@ -1848,13 +2254,42 @@ sub stats_print($) {
   return $t;
 }
 
+# Helper functions to normalize and humanize entry tags
+sub normalize_entry_tags {
+  my $rTagline = shift @_;
+  my @tags = split(/\s*[;,]\s*/, $$rTagline);
+  $$rTagline = join(';', @tags);
+  return 0;
+}
+sub humanize_entry_tags {
+  my $tagline = shift @_;
+  my @tags = split(/\s*[;,]\s*/, $tagline);
+  return join(', ', @tags);
+}
+
+# Function to return a data structure to support adding/editing entries
 sub get_entry_fields {
+  my $kdb_ver = shift @_ || 1; # *.kdb or *.kdbx (v1 or v2)
   my @fields = (
 	{ key=>'title', txt=>'Title' },
 	{ key=>'username', txt=>'Username' },
 	{ key=>'password', txt=>'Password',
 		hide_entry => 1, double_entry_verify => 1, genpasswd => 1 },
 	{ key=>'url', txt=>'URL' },
+  );
+  # We only want "tags" if we are dealing with a v2 file (*.kdbx)
+  if ($kdb_ver == 2) {
+    push @fields, (
+	{ key=>'tags', txt=>'Tags', 'multiline' => 0,
+		user_prep_func => \&humanize_entry_tags,
+		validate_func => \&normalize_entry_tags,
+	 },
+	{ key=>'strings', txt=>'Strgs',
+		user_edit_func => \&edit_entry_strings,
+	 },
+	);
+  }
+  push @fields, (
 	{ key=>'comment', txt=>'Notes/Comments', 'multiline' => 1 },
 	);
   return @fields;
@@ -2013,10 +2448,15 @@ sub cli_new($) {
     'group' => $id,
   };
 
-  my @fields = get_entry_fields();
+  my @fields = get_entry_fields($state->{kdb_ver});
   NEW_DATA_COLLECTION: foreach my $input (@fields) {
     my $val = '';
-    if ($input->{multiline}) {
+    if (defined($input->{user_edit_func})) {
+      $val = $input->{user_edit_func}($new_entry, $input, {});
+      # An empty hash-ref is "empty/blank" for strings, but the
+      # user_edit_func returns the scalar '' in that case.
+      if ($input->{key} eq 'strings' && ref($val) ne 'HASH') { $val = {}; }
+    } elsif ($input->{multiline}) {
       $val = new_edit_multiline_input($input, '');
     } else {
       if ($new_title ne '' && $input->{key} eq 'title') {
@@ -2030,6 +2470,14 @@ sub cli_new($) {
     if (recent_sigint()) { return undef; }
     # If the user gave us an empty title, abort the new entry
     if ($input->{key} eq 'title' && length($val) == 0) { return undef; }
+    # Call the validate_func if it's defined
+    if (defined($input->{validate_func}) && length($val)) {
+      # Note that $val can be modified by the validate_func
+      if ($input->{validate_func}(\$val) != 0) {
+        print "Invalid $input->{txt} input.\n";
+        return -1;
+      }
+    }
     # Check the new title for same-name conflicts in its group
     if ($input->{key} eq 'title') {
       if ($val =~ m/\//) {
@@ -2147,6 +2595,19 @@ sub cli_export($$) {
     }
   }
 
+  # Ask if the key file should be generated, if it doesn't exist
+  my $make_keyfile=0;
+  if (defined($key_file) && (! -f $key_file)) {
+    print "Your specified key file does not exist. Generate it? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+    $make_keyfile=1;
+    if (recent_sigint()) { return undef; } # Bail on SIGINT
+  }
+
   # Get the master password for the exported file
   my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
@@ -2154,6 +2615,23 @@ sub cli_export($$) {
   if (length($master_pass) == 0) {
     print "For your safety, empty passwords are not allowed...\n";
     return;
+  }
+
+  # Generate the key file if so instructed
+  if (defined($key_file) && $make_keyfile) {
+    my $fh=new FileHandle;
+    if (! open($fh,'>',$key_file)) {
+      print "ERROR: Could not open key file for writing: $key_file\n";
+      return -1;
+    }
+    my $KEYFILE_SIZE = 2048;
+    print $fh generateKeyfileContents($KEYFILE_SIZE);
+    close($fh);
+    my $size = (stat($key_file))[7];
+    if ($size != $KEYFILE_SIZE) {
+      print "ERROR: generated key file is the wrong size: $key_file\n";
+      return -1;
+    }
   }
 
   # Build the new kdb in RAM
@@ -2256,6 +2734,19 @@ sub cli_saveas($) {
     if (recent_sigint()) { return undef; } # Bail on SIGINT
   }
 
+  # Ask if the key file should be generated, if it doesn't exist
+  my $make_keyfile=0;
+  if (defined($key_file) && (! -f $key_file)) {
+    print "Your specified key file does not exist. Generate it? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) ne 'y') {
+      return -1;
+    }
+    $make_keyfile=1;
+    if (recent_sigint()) { return undef; } # Bail on SIGINT
+  }
+
   # Get the master password for the file
   my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
@@ -2263,6 +2754,23 @@ sub cli_saveas($) {
   if (length($master_pass) == 0) {
     print "For your safety, empty passwords are not allowed...\n";
     return;
+  }
+
+  # Generate the key file if so instructed
+  if (defined($key_file) && $make_keyfile) {
+    my $fh=new FileHandle;
+    if (! open($fh,'>',$key_file)) {
+      print "ERROR: Could not open key file for writing: $key_file\n";
+      return -1;
+    }
+    my $KEYFILE_SIZE = 2048;
+    print $fh generateKeyfileContents($KEYFILE_SIZE);
+    close($fh);
+    my $size = (stat($key_file))[7];
+    if ($size != $KEYFILE_SIZE) {
+      print "ERROR: generated key file is the wrong size: $key_file\n";
+      return -1;
+    }
   }
 
   destroy_found();
@@ -2328,10 +2836,11 @@ sub cli_rmdir($) {
 
   my $group_id = $state->{all_grp_paths_fwd}->{$grp_path};
   my $group = $state->{kdb}->find_group({ id => $group_id });
+  my @entries = ();
   my $entry_cnt=0;
   if (defined($group->{entries})) {
-    $entry_cnt=
-	scalar(grep(m/^\Q$grp_path\E\0/,keys %{$state->{all_ent_paths_fwd}}));
+    @entries = grep(m/^\Q$grp_path\E\0/,keys %{$state->{all_ent_paths_fwd}});
+    $entry_cnt = scalar(@entries);
   }
   my $group_cnt=0;
   if (defined($group->{entries})) {
@@ -2348,9 +2857,21 @@ sub cli_rmdir($) {
       return -1;
     }
   }
-  my $deleted_group = $state->{kdb}->delete_group({ id => $group_id });
 
-  # Because we removed a group we need to refresh our state paths
+  # Recycle any entries that we're also removing
+  if ($entry_cnt > 0) {
+    if (! (defined($opts->{'no-recycle'}) && int($opts->{'no-recycle'}))) {
+      foreach my $ent_path (@entries) {
+        my $ent_id = $state->{all_ent_paths_fwd}->{$ent_path};
+        my $ent = $state->{kdb}->find_entry({id => $ent_id});
+        my $errmsg = recycle_entry($state, $ent);
+        if (defined($errmsg)) { print "WARNING: $errmsg\n"; }
+      }
+    }
+  }
+
+  # Delete the group, refresh our state paths, request save, etc.
+  my $deleted_group = $state->{kdb}->delete_group({ id => $group_id });
   refresh_state_all_paths();
   $state->{kdb_has_changed}=1;
   RequestSaveOnDBChange();
@@ -2434,10 +2955,12 @@ sub cli_open($) {
 
 # Get a single keypress from the user
 sub get_single_key {
+  my $drain_first = shift @_ || 1;
   our $state;
   my $key='';
   $|=1; # Needed to flush STDOUT on Windows cmd prior to calling ReadMode
   ReadMode('raw'); # Turn off controls keys
+  while($drain_first && defined( $key = ReadKey(-1) ) ) {} # Drain STDIN first
   while (not defined ($key = ReadKey(-1))) {
     # If the user hit ^C (SIGINT) then we need to stop
     if (recent_sigint()) { return undef; }
@@ -2446,6 +2969,28 @@ sub get_single_key {
   }
   ReadMode('restore');
 return $key;
+}
+# Get a single line of input from the user
+sub get_single_line {
+  our $state;
+  $|=1; # Needed to flush STDOUT on Windows cmd prior to calling ReadMode
+  my $input='';
+  while (1) {
+    my $c  = get_single_key(0);
+    if (ord($c) == 3) { # ^C
+      return '';
+    } elsif (ord($c) == 127 || ord($c) == 8) { # backspace (Linux/Windows)
+      if (length($input) > 0) {
+        $input = substr($input,0,length($input) - 1);
+        print chr(8)." ".chr(8); # Erase a character
+      }
+    } elsif ($c =~ m/[\n\r]/) {
+      return $input;
+    } else {
+      $input.=$c;
+      print $c;
+    }
+  }
 }
 
 sub cli_close {
@@ -2473,6 +3018,8 @@ sub new_kdb {
   my $state=shift @_;
   $state->{kdb_has_changed}=0;
   $state->{'kdb'} = File::KeePass->new;
+  #$state->{kdb_ver} = $state->{kdb}->{header}->{version}; # undef after ->new()
+  $state->{kdb_ver} = 1; # Only provide 1.x (*.kdb) features by default
   # To be compatible with KeePassX
   $state->{'kdb'}->add_group({ title => 'eMail' });
   $state->{'kdb'}->add_group({ title => 'Internet' });
@@ -2579,6 +3126,290 @@ sub eof_exit_hook {
   return cli_quit($state->{term},undef);
 }
 
+# Entry attachment handling
+sub cli_attach {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
+    return;
+  }
+
+  my $target = $params->{args}->[0];
+  my $ent=find_target_entity_by_number_or_path($target);
+  if (! defined($ent)) {
+    print "Don't see an entry at path: $target\n";
+    return -1;
+  }
+
+  my $tmp_ent = clone($ent); # Clone the entity
+  $state->{attach_changed} = 0;
+  ATTACH_INTERFACE: while (1) {
+    my @strings_keys = ();
+    if (defined($tmp_ent->{binary}) && ref($tmp_ent->{binary}) eq 'HASH') {
+      @strings_keys = sort keys %{$tmp_ent->{binary}};
+    }
+    my $strings_count = scalar(@strings_keys);
+    my $t='';
+    my $prompt = "Choose";
+    if ($strings_count > 0) {
+      $t .= show_helper_files_strings($tmp_ent,{f=>1,v=>1},'binary');
+      $t .= "$prompt: (a)dd/(e)xport/(d)elete/(c)ancel/(F)inish? ";
+    } else {
+      $t .= "No files attached.\n";
+      $t .= "$prompt: (a)dd/(c)ancel/(F)inish? ";
+    }
+    print "$t";
+    COMMAND: while (my $key=get_single_key()) {
+      if (lc($key) eq 'c' || ord($key) == 3) { # Cancel or ^C
+        print "\n";
+        delete $state->{attach_changed}; # Delete our temporary state var
+        return;
+      } elsif ($key =~ m/^[fF\r\n]$/) { # Finished (save)
+        print "\n";
+        $ent->{binary} = $tmp_ent->{binary};
+        if ($state->{attach_changed}) {
+          delete $state->{attach_changed}; # Delete our temporary state var
+          # Recycle the entry if changes were made unless --no-recycle
+          if (!(defined($opts->{'no-recycle'}) && int($opts->{'no-recycle'}))) {
+            my $errmsg = recycle_entry($state, $ent);
+            if (defined($errmsg)) { print "WARNING: $errmsg\n"; }
+          }
+          $state->{kdb_has_changed} = 1;
+          RequestSaveOnDBChange();
+        }
+        return;
+      } elsif (lc($key) eq 'd') {
+        if (defined($tmp_ent->{binary}) && ref($tmp_ent->{binary}) eq 'HASH') {
+          if ($strings_count < 2) {
+            %{$tmp_ent->{binary}} = ();
+            $state->{attach_changed}=1 if ($strings_count == 1);
+          } else {
+            print "\r". " "x60 ."\rWhich entry number do you want to delete? ";
+            my $choice = get_single_line();
+            if ($choice !~ m/^\d+$/ || $choice<1 || $choice > $strings_count) {
+              print "\nInvalid number.";
+            } else {
+              delete($tmp_ent->{binary}->{$strings_keys[$choice-1]});
+              $state->{attach_changed}=1;
+            }
+          }
+          print "\n";
+          next ATTACH_INTERFACE;
+        }
+      } elsif (lc($key) eq 'e') { # export
+        my $to_export = undef;
+        if (defined($tmp_ent->{binary}) && ref($tmp_ent->{binary}) eq 'HASH') {
+          if ($strings_count < 1) {
+            print "\n" .color('yellow'). 'Nothing it attached to export...' .
+							color('clear')."\n";
+          } elsif ($strings_count == 1) {
+            $to_export = $strings_keys[0];
+          } else {
+            print "\r". " "x60 ."\rWhich entry number do you want to export? ";
+            my $choice = get_single_line();
+            if ($choice !~ m/^\d+$/ || $choice<1 || $choice > $strings_count) {
+              print "\nInvalid number.";
+            } else {
+              $to_export = $strings_keys[$choice-1];
+            }
+          }
+        }
+        if (defined($to_export) && defined($tmp_ent->{binary}->{$to_export})) {
+          my $homedir=get_user_homedir();
+          my $filename = $to_export;
+          my @path = File::Spec->splitdir($homedir);
+          my $iv = File::Spec->catfile(@path, $filename); # homedir/filename
+          print "\n";
+          my $filename = prompt_filename_from_user($self,"Path to file: ",$iv);
+          if (! length($filename)) { next ATTACH_INTERFACE; }
+          if (lc($OSNAME) !~ m/^mswin/) { $filename=expand_tildes($filename); }
+          # If we're given a directory, assume the user wants to write into it
+          if (-e -d $filename) { $filename .= '/' . $to_export; }
+          if (-e -f $filename) {
+            print color('yellow'). "WARNING: file already exists: $filename\n" .
+                "Overwrite it? [y/N] " .color('clear');
+            my $key=get_single_key();
+            print "\n";
+            if (lc($key) ne 'y') {
+              next ATTACH_INTERFACE;
+            }
+          }
+          my $fh = new FileHandle;
+          if (! open($fh,'>', $filename)) {
+            print "ERROR: cannot write to: $filename\n";
+            next ATTACH_INTERFACE;
+          }
+          print $fh $tmp_ent->{binary}->{$to_export};
+          close $fh;
+          print "Saved to: $filename\n";
+        }
+        next ATTACH_INTERFACE;
+      } elsif (lc($key) eq 'a') { # add
+        if ($strings_count > 0 && $state->{kdb_ver} == 1) {
+          print "\n" .color('yellow').
+		'KeePass v1 files support only one attachment per entry.' .
+							color('clear')."\n";
+          next ATTACH_INTERFACE;
+        }
+        print "\n";
+        my $filename = prompt_filename_from_user($self, "Path to file: ", "");
+        if (! length($filename)) { next ATTACH_INTERFACE; }
+        my $errmsg = do_attach_file($tmp_ent, $filename);
+        if (defined($errmsg)) {
+          print color('yellow'). "Error: $errmsg" .color('clear'). "\n";
+        }
+        next ATTACH_INTERFACE;
+      } else {
+        # Do nothing on invalid input
+        next COMMAND;
+      }
+    }
+  }
+
+  #return $initial_value;
+}
+# Helper function for cli_attach
+sub prompt_filename_from_user {
+  my $self = shift @_;
+  my $prompt = shift @_;
+  my $initial_value = shift @_;
+
+  my $term = get_prepped_readline_term();
+  # Set a completion function for files
+  my $old_compfunc=undef;
+  if (my $attr = $term->Attribs) {
+    # filename_completion_function works for Gnu Readline
+    if (defined($attr->{filename_completion_function})) {
+      $old_compfunc = $attr->{completion_entry_function};
+      $attr->{completion_entry_function} =
+			$attr->{filename_completion_function};
+    }
+  }
+  # TODO - this need more testing with Perl readlines!!!
+  if ($self->{term}->ReadLine eq 'Term::ReadLine::Perl') {
+    #$readline::rl_completion_function = "rl_filename_list";
+    $old_compfunc = $readline::rl_completion_function;
+    $readline::rl_completion_function = \&my_nongnu_complete_files;
+  } elsif ($self->{term}->ReadLine eq 'Term::ReadLine::Perl5') {
+    $old_compfunc=$Term::ReadLine::Perl5::readline::rl_completion_function;
+    $Term::ReadLine::Perl5::readline::rl_completion_function =
+					\&my_nongnu_complete_files;
+  }
+  my $filename = $term->readline($prompt, $initial_value);
+  $filename =~ s/^\s+//; $filename =~ s/\s+$//; # Trim the input
+  # Restore the old completion function
+  if (defined($old_compfunc)) {
+    if (my $attr = $term->Attribs) {
+     $attr->{completion_entry_function} = $old_compfunc;
+    }
+    if ($self->{term}->ReadLine eq 'Term::ReadLine::Perl') {
+      $readline::rl_completion_function = $old_compfunc;
+    }
+    if ($self->{term}->ReadLine eq 'Term::ReadLine::Perl5') {
+      $Term::ReadLine::Perl5::readline::rl_completion_function =
+							$old_compfunc;
+    }
+  }
+  return $filename;
+}
+# Helper function for cli_attach
+sub do_attach_file {
+  my $entry = shift @_;
+  my $path_to_file = shift @_;
+  our $state;
+
+  if (! -f $path_to_file) {
+    return "File not found at: $path_to_file";
+  }
+  my $size = -s $path_to_file;
+  if ($size > $MAX_ATTACH_SIZE) {
+    my $sizeK = sprintf("%0.02f", $size / 1024);
+    my $maxSizeK = sprintf("%0.02f", $MAX_ATTACH_SIZE / 1024);
+    return "File is too large ($sizeK versus $maxSizeK KB maximum).";
+  }
+  my $fname_short = basename($path_to_file);
+  if (defined($entry->{binary}->{$fname_short})) {
+    return "An attachement named \"$fname_short\" already exists.\n";
+  }
+  # If we get this far we're OK to attach it
+  open(my $fh,'<',$path_to_file) || return "Couldn't open file $path_to_file";
+  read($fh, my $buffer, $size);
+  close $fh;
+  if (length($buffer) != $size) {
+    return "Couldn't read entire key file contents of $path_to_file.\n";
+  }
+
+  $entry->{binary}->{$fname_short} = $buffer;
+  $state->{attach_changed}=1;
+  return undef;
+}
+# Cross-platform attempt to find a user's homedir
+sub get_user_homedir {
+  if (lc($OSNAME) =~ m/^mswin/ &&
+			defined($ENV{HOMEDRIVE}) && defined($ENV{HOMEPATH})) {
+    #return $ENV{HOMEDRIVE} . $ENV{HOMEPATH}; # Windows
+    return File::Spec->catpath($ENV{HOMEDRIVE}, $ENV{HOMEPATH}, undef);
+  }
+  my $home = $ENV{HOME} || $ENV{LOGDIR} || (getpwuid($<))[7] || undef; #Unix
+  return $home;
+}
+# Expand tildes in filename
+sub expand_tildes {
+  my $filename = shift @_;
+  # Page 253 of Perl Cookbook By Tom Christiansen, Nathan Torkington
+  # "O'Reilly Media, Inc.", Aug 21, 2003
+  $filename =~ s{ ^ ~ ( [^/]* ) }
+		{ $1
+			? (getpwnam($1))[7]
+			: ($ENV{HOME} || $ENV{LOGDIR} || (getpwuid($<))[7])
+		}ex;
+  return $filename;
+}
+
+# Copied from Term::ShellUI and modified for enhanced Windows support
+sub my_nongnu_complete_files {
+    my ($str, $line, $start) = @_;
+
+    #$self->suppress_completion_append_character();
+    if (defined($readline::rl_completer_terminator_character)) {
+      $readline::rl_completer_terminator_character='';
+    }
+    if (defined($Term::ReadLine::Perl5::readline::rl_completer_terminator_character)) {
+      $Term::ReadLine::Perl5::readline::rl_completer_terminator_character='';
+    }
+
+    my ($volume,$directories,$file) = File::Spec->splitpath($str || '.', 0 );
+    # This next line is for Windows tab completion on just "C:","D:", etc.
+    if (length($volume) && !length($directories)) { $directories='/'; }
+    my $dir = File::Spec->catpath($volume,$directories,undef);
+
+    # eradicate non-matches immediately (this is important if
+    # completing in a directory with 3000+ files)
+    $file = '' unless $str;
+    my $flen = length($file);
+
+    my @files = ();
+    if(opendir(DIR, length($dir) ? $dir : '.')) {
+        @files = grep { substr($_,0,$flen) eq $file } readdir DIR;
+        closedir DIR;
+        # eradicate dotfiles unless user's file begins with a dot
+        @files = grep { /^[^.]/ } @files unless $file =~ /^\./;
+        # reformat filenames to be exactly as user typed
+        @files = map { length($dir) ? ($dir eq '/' ? "/$_" : "$dir/$_") : $_ } @files;
+    } else {
+        print("Couldn't read dir: $!\n");
+    }
+
+    # Tack trailing slashs on dirs
+    foreach my $file_dir (@files) {
+      if (-d $file_dir && $file_dir !~m/\/$/) { $file_dir .= '/'; }
+    }
+
+    return @files;
+}
+
 sub cli_quit($$) {
   my $self = shift @_;
   my $params = shift @_;
@@ -2645,10 +3476,41 @@ sub cli_version($$) {
     }
     print "\n";
     print "ReadLine being used: " . $term->{term}->ReadLine . "\n";
-    print "Operating system: $OSNAME\n";
+    # Operating System
+    my $OS=$OSNAME;
+    if (lc($OSNAME) eq 'linux') {
+      my $lsbr = load_lsb_release();
+      if (defined($lsbr) && defined($lsbr->{'DISTRIB_DESCRIPTION'})) {
+        $OS .= " (" . $lsbr->{'DISTRIB_DESCRIPTION'} . ")";
+      }
+    } elsif (lc($OSNAME) eq 'mswin') {
+      if (! $OPTIONAL_PM{'Win32'}->{loaded}) {
+        runtime_load_module(\%OPTIONAL_PM,'Win32',undef);
+      }
+      if ($OPTIONAL_PM{'Win32'}->{loaded}) {
+        $OS .= " (" . Win32::GetOSDisplayName() . ")";
+      }
+    }
+    print "Operating system: $OS\n";
   } else {
     print "$VERSION\n";
   }
+}
+
+sub load_lsb_release {
+  my $fh = new FileHandle;
+  if (-f '/etc/lsb-release' && open($fh,'<', '/etc/lsb-release')) {
+    my @lines = <$fh>;
+    close $fh;
+    my %d = ();
+    foreach my $l (@lines) {
+      chomp $l;
+      my ($k,$v) = split(/=/, $l, 2);
+      $d{$k} = $v;
+    }
+    return \%d;
+  }
+  return undef;
 }
 
 # Function to nag the user about saving each time the DB is modified
@@ -2756,7 +3618,7 @@ sub GetPassword {
 sub MyGetOpts {
   my %opts=();
   my $result = &GetOptions(\%opts, "kdb=s", "key=s", "histfile=s",
-						"help", "h", "readonly");
+				"help", "h", "readonly", "no-recycle");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -2794,14 +3656,21 @@ sub MyGetOpts {
 }
 
 sub GetUsageMessage {
+  my @params = (
+    [ kdb => 'Optional KeePass database file to open (must exist).' ],
+    [ key => 'Optional KeePass key file (must exist).' ],
+    [ histfile => 'Specify your history file (or perhaps /dev/null).' ],
+    [ readonly => 'Run in read-only mode; no changes will be allowed.' ],
+    [ 'no-recycle' =>
+		'Don\'t store entry changes in /Backup or "/Recycle Bin".' ],
+    [ help => 'This message.' ],
+  );
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
-  "\n" .
-  "    --help\tThis message.\n" .
-  "    --kdb\tOptional KeePass database file to open (must exist).\n" .
-  "    --key\tOptional KeePass key file (must exist).\n" .
-  "    --histfile\tSpecify your history file (or perhaps /dev/null).\n" .
-  "    --readonly\tRun in read-only mode; no changes will be allowed.\n" .
-  "\n" .
+  "\n";
+  foreach my $param (@params) {
+    $t .= sprintf("  %-13s %s\n", '--'.$param->[0], $param->[1]);
+  }
+  $t .= "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
   "about kpcli's commands.\n" .
   "";
@@ -3113,6 +3982,21 @@ sub warn_if_file_changed {
   return 0;
 }
 
+sub generateKeyfileContents($) {
+  my $length = shift;
+  my $password = '';
+  my @normal_chars=('a'..'z','A'..'Z',0..9);
+  # all printable non-alnum chars except space (0x20), backspace (0x5c),
+  # and backtick (0x60)
+  my @special_chars=map(chr, 0x21 .. 0x2f, 0x3a .. 0x40,
+					0x5b, 0x5d .. 0x5f, 0x7b .. 0x7e);
+  my $charset = join('', (@normal_chars,@special_chars));
+  while (length($password) < $length) {
+    $password .= substr($charset, (int(rand(length($charset)))), 1);
+  }
+  return $password;
+}
+
 sub generatePassword {
   my $be_silent = shift @_ || 0;
   my $password = generatePasswordFromDict($be_silent);
@@ -3128,22 +4012,129 @@ sub generatePassword {
 }
 
 sub generatePasswordGobbledygook {
-   my $length = shift;
-   my @normal_chars=('a'..'z','A'..'Z',0..9);
-   my @special_chars=qw(_);
-   my $charset = join('', (@normal_chars,@special_chars));
-   # Generate the password
-   my $password = '';
-   while (length($password) < $length) {
-     $password .= substr($charset, (int(rand(length($charset)))), 1);
-   }
-   # Make sure that at least one special character appears
-   my $sccc=join('', @special_chars);
-   if ($password !~ m/[\Q$sccc\E]/) {
-     my $sc=$special_chars[int(rand(length($sccc)))];
-     substr($password,int(rand(length($password))), 1, $sc);
-   }
-   return $password
+  my $length = shift;
+  my @normal_chars=('a'..'z','A'..'Z',0..9);
+  my @special_chars=qw(_);
+  my $charset = join('', (@normal_chars,@special_chars));
+  # Generate the password
+  my $password = '';
+  while (length($password) < $length) {
+    $password .= substr($charset, (int(rand(length($charset)))), 1);
+  }
+  # Make sure that at least one special character appears
+  my $sccc=join('', @special_chars);
+  if ($password !~ m/[\Q$sccc\E]/) {
+    my $sc=$special_chars[int(rand(length($sccc)))];
+    substr($password,int(rand(length($password))), 1, $sc);
+  }
+  return $password
+}
+
+sub genPassInteractiveHelper($$) {
+  my $mode = shift @_;
+  my $len = shift @_;
+  if ($mode eq 'g') {
+    return generatePasswordGobbledygook($len);
+  } elsif ($mode eq 'w') {
+    return generatePasswordFromDict(0);
+  } else {
+    return undef;
+  }
+}
+
+sub generatePasswordInteractive($) {
+  my $default_passwd_len = shift @_;
+
+  print "\n";
+  print "INTERACTIVE PASSWORD GENERATION:\n";
+  print "<n>o/<ret> Do not accept current password, generate another one.\n";
+  print "<y>es      Accept current password.\n\n";
+  print "<t>oggle   Toggle between random characters and word-based mode.\n";
+  print "<c>ancel   Abort interactive password generation mode.\n";
+  print "And in random characters mode:\n";
+  print "  +/-      Increase/decrease password length. " .
+				"May be prefixed with a count.\n";
+  print "  [n]=     Set password length to [n] chars. If not given, " .
+				"resets to $DEFAULT_PASSWD_LEN chars.\n";
+
+  my $pw_is_ok = 0;
+  my $len = $default_passwd_len;
+
+  my $mode = 'g';
+  my $pw = genPassInteractiveHelper($mode,$len);
+  do {
+    my $prompt_format = "%s  +/-/= n/y/t/c ";
+    if ($mode eq 'w') {  $prompt_format = "%s  n/y/t/c "; }
+    my $prompt = sprintf($prompt_format, $pw);
+    print $prompt;
+    my $input = '';
+    my $input_complete = 0;
+    do {
+      if (recent_sigint()) { return undef; }
+      my $k  = get_single_key();
+      if (recent_sigint()) { return undef; }
+      my $kc = unpack("C", $k);
+      if ($kc == 0x03) {   # ^C
+        return undef;
+      } elsif ($kc == 127 || $kc == 8) { # backspace (Linux/Windows)
+        if (length($input) > 0) {
+          $input = substr($input,0,length($input) - 1);
+          print chr(8)." ".chr(8); # Erase a character
+          #print $k; # Print the backspace key to erase a character
+        }
+      } elsif ($kc == 0x0a) {
+        $input = '';
+        $input_complete = 1;
+      } else {
+        # Validate character input then process it
+        if ($input eq '' && $k =~ m/^[tcny]$/
+		|| ($mode eq 'g' && $k =~ m/^[\d\+\-=]$/ && $input =~ m/^\d*$/)
+								) {
+          $input .= $k;
+          if ($mode eq 'g' && $input =~ /^(\d+)?[+=-]$/) {$input_complete=1;}
+          if ($input =~ /^[tcny]$/ ) { $input_complete = 1; }
+          if ($input =~ /^\d/) { print $k; }
+        }
+      }
+    } while (!$input_complete);
+    print "\n";
+
+    if (lc($input) eq 't') {
+      if ($mode eq 'g') { $mode = 'w' } else { $mode = 'g'; }
+      $input = 'n';
+    }
+
+    if ($input eq 'y') {
+      length($pw) and $pw_is_ok = 1;
+    } elsif ($mode eq 'g' && $input =~ /^(\d+)?[+=-]$/) {
+      my $new_len = $DEFAULT_PASSWD_LEN;
+      if ($input =~ /^(\d+)?=$/) {
+        $new_len = $1 || $DEFAULT_PASSWD_LEN;
+      } elsif ($input =~ /^(\d+)?([+-])$/) {
+        my $v = $1 ? $1 : 1;
+        $v *= $2 eq '-' ? -1 : 1;
+        $new_len = $len + $v;
+      }
+      if ($new_len < $DEFAULT_PASSWD_MIN) {
+        $len = $DEFAULT_PASSWD_MIN;
+      } elsif ($new_len > $DEFAULT_PASSWD_MAX) {
+        $len = $DEFAULT_PASSWD_MAX;
+      } else {
+        $len = $new_len;
+        printf "[%s%s%s]\n",
+          '-' x ($len - $DEFAULT_PASSWD_MIN), '|',
+          '-' x ($DEFAULT_PASSWD_MAX - $len);
+      }
+      if (recent_sigint()) { return undef; }
+      $pw = genPassInteractiveHelper($mode,$len);
+    } elsif ($input eq 'c') {
+      return undef; # Return undef on cancel
+    } elsif ($input eq 'n' || !$input) {
+      if (recent_sigint()) { return undef; }
+      $pw = genPassInteractiveHelper($mode,$len);
+    }
+  } while (!$pw_is_ok);
+  return($pw);
 }
 
 # Inspired by http://xkcd.com/936/
@@ -3212,8 +4203,7 @@ sub setup_signal_handling {
   # Install a signal handler to catch SIGINT (^C). Unsafe signal handling
   # (through POSIX::SigAction) is required to deal with Term::ReadLine::Gnu.
   # We don't even try for other readlines due to their limited functionality.
-  sigaction SIGINT, new POSIX::SigAction
-    sub {
+  my $handler_SIGINT = sub {
       our $state;
       # We could be using one of a couple of ReadLine terminals; the one
       # from Term::ShellUI ($state->{'term'}->{term}) or one from one of
@@ -3262,41 +4252,29 @@ sub setup_signal_handling {
         $term->forced_update_display();   # Force update the display
       }
       return 0;
-    };
+  };
+  sigaction(SIGINT, new POSIX::SigAction($handler_SIGINT));
+  #$SIG{INT} = $handler_SIGINT; # Works only if $ENV{PERL_SIGNAL}='unsafe'
+  #https://groups.google.com/forum/#!topic/perl.perl5.porters/fNJdyyZh7Wc
 
-  # Handle signal TSTP - terminal stop (user pressing Ctrl-Z)
-  sigaction SIGTSTP, new POSIX::SigAction
-	  sub {
-		our $state;
-		my $term = $state->{'term'}->{term};
-		my $mess = longmess();
-                # At some point, Term::ShellUI started wrapping my cli_XXX()
-                # routines in eval{}, which hid the cli_\w+() from the longmess,
-                # and so I had to add a second condition here.
-                if ($mess =~ m/(main::(cli_\w+)\(|Term::ShellUI::call_cmd\()/ &&
+  # Handle signal CONT - continue signal (resuming after Ctrl-Z).
+  my $handler_SIGCONT = sub {
+	our $state;
+	my $term = $state->{'term'}->{term};
+	my $mess = longmess();
+               # At some point, Term::ShellUI started wrapping my cli_XXX()
+               # routines in eval{}, which hid the cli_\w+() from the longmess,
+               # and so I had to add a second condition here.
+       if ($mess =~ m/(main::(cli_\w+)\(|Term::ShellUI::call_cmd\()/ &&
 					defined($state->{active_readline})) {
-		  $term = $state->{active_readline};
-		}
-		$term->cleanup_after_signal();
-		$term->reset_after_signal();
-	  };
-  # Handle signal CONT - continue signal (assuming after Ctrl-Z).
-  sigaction SIGCONT, new POSIX::SigAction
-	  sub {
-		our $state;
-		my $term = $state->{'term'}->{term};
-		my $mess = longmess();
-                # At some point, Term::ShellUI started wrapping my cli_XXX()
-                # routines in eval{}, which hid the cli_\w+() from the longmess,
-                # and so I had to add a second condition here.
-                if ($mess =~ m/(main::(cli_\w+)\(|Term::ShellUI::call_cmd\()/ &&
-					defined($state->{active_readline})) {
-		  $term = $state->{active_readline};
-		}
-		$term->cleanup_after_signal();
-		$term->reset_after_signal();
-		$term->forced_update_display(); # Force update the display
-	  };
+	  $term = $state->{active_readline};
+	}
+	$term->cleanup_after_signal();
+	$term->reset_after_signal();
+	$term->forced_update_display(); # Force update the display
+  };
+  sigaction(SIGCONT, new POSIX::SigAction($handler_SIGCONT));
+  #$SIG{CONT} = $handler_SIGCONT; # Works only if $ENV{PERL_SIGNAL}='unsafe'
 }
 
 # Code consolidation function to runtime-load optional perl modules
@@ -3327,6 +4305,7 @@ sub get_readline_term($$) {
   my $rOPTIONAL_PM = shift @_;
   my $app_name = shift @_;
   my @rl_modules = ();
+  # The list of readlines that we support
   push @rl_modules, 'Term::ReadLine::Gnu';
   push @rl_modules, 'Term::ReadLine::Perl';
   push @rl_modules, 'Term::ReadLine::Perl5';
@@ -3522,26 +4501,44 @@ kpcli and not supported on MS Windows.
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
-Only interoperability tested with KeePassX (http://www.keepassx.org/).
+The main author of kpcli primarily interoperability tests with KeePassX
+(http://www.keepassx.org/) and primarily uses KeePass v1 (*.kdb) files.
+Support for KeePass v2 (*.kdbx) files in kpcli is substantial, and many
+people use it daily, but it is not the author's primary use case. It is
+also the author's intent to maintain compatibility with v1 files, and so
+anyone sending patches, for consideration for inclusion in future kpcli
+versions, is asked to validate them with both v1 and v2 files.
 
-Prior to version 2.3, File::KeePass had a bug related to some "unknown"
-data that KeePassX stores in group records. For File::KeePass < v2.3,
+=head2 No history tracking for KeePass 2 (*.kdbx) files
+
+Recording entries' history in KeePass 2 files is not implemented. History
+that exists in a file is not destroyed, but results of entry changes made
+in kpcli are not recorded into their history. Prior-to-change copies are
+stored into the "Recycle Bin." Note that File::KeePass does not encrypt
+passwords of history entries in RAM, like it does for current entries.
+This is a small security risk that can, in theory, allow priviledged users
+to steal your passwords from RAM, from entry history.
+
+=head2 File::KeePass bug prior to version 2.03
+
+Prior to version 2.03, File::KeePass had a bug related to some "unknown"
+data that KeePassX stores in group records. For File::KeePass < v2.03,
 kpcli deletes those unknown data when saving. Research in the libkpass
 (http://libkpass.sourceforge.net/) source code revealed that what early
 versions of File::KeePass classifies as "unknown" are the times for
-created/modified/accessed/expires as well as "flags" (id=9), but only
-for groups; File::KeePass handled those fields just fine for entries.
-I found no ill-effect from dropping those fields when saving and so
-that is what kpcli does to work around the File::KeePass bug, if kpcli
-is using File::KeePass < v2.3.
+created/modified/accessed/expires as well as "flags" (id=9), but only for
+groups; File::KeePass handled those fields just fine for entries.  I found
+no ill-effect from dropping those fields when saving and so that is what
+kpcli does to work around the File::KeePass bug, if kpcli is using
+File::KeePass < v2.03.
 
 =head1 BUGS
 
 =head2 Using Ctrl-D to Exit
 
 Versions of Term::ShellUI prior to v0.9. do not have the ability to trap
-Ctrl-D exits by the client program. I submitted a patch to remedy that
-and it made it into Term::ShellUI v0.9. Please upgrade if kpcli asks you to.
+Ctrl-D exits by the client program. I submitted a patch to remedy that and
+it made it into Term::ShellUI v0.9. Please upgrade if kpcli asks you to.
 
 =head2 Multiple Entries or Groups With the Same Name in the Same Group
 
@@ -3695,14 +4692,49 @@ this program would not have been practical for me to author.
                     Removed unneeded use of Term::ReadLine.
                     Quieted "inherited AUTOLOAD for non-method" warns
                      caused by Term::Readline::Gnu on perl 5.14.x.
+ 2014-Jun-06 v2.6 - Added interactive password generation ("i" method).
+                     - Thanks to Florian Tham for the idea and patch.
+                    Show entry's tags if present (KeePass >= v2.11).
+                     - Thanks to Florian Tham for the patch.
+                    Add/edit support for tags if a v2 file is opened.
+                    Added tags to the searched fields for "find -a".
+                    Show string fields (key/val pairs) in v2 files.
+                    Add/edit for string fields if a v2 file is opened.
+                    Show information about entries' file attachments.
+                     2014-03-20 SourceForge feature request #6.
+                    New "attach" command to manage file attachments.
+                    Added "Recycle Bin" functionality and --no-recycle.
+                    For --readonly, don't create a lock file and don't
+                     warn if one exists. 2014-03-27 SourceForge bug #11.
+                    Added key file generation to saveas and export.
+                     2014-04-19 SourceForge bug #13.
+                    Added -expired option to the find command.
+                    Added "dir" as an alias for "ls"
+                    Added some additional info to the stats command.
+                    Added more detailed OS info for Linux/Win in vers.
+                    Now hides Meta-Info/SYSTEM entries.
+                    Fixed bug with SIGTSTP handling (^Z presses).
+                    Fixed missing refresh_state_all_paths() in cli_rm.
+ 2014-Jun-11 v2.7 - Bug fix release. Broke the open command in 2.6.
 
 =head1 TODO ITEMS
+
+  Consider adding a purge command for "Backup"/"Recycle Bin" folders.
+
+  Consider adding a tags command for use with v2 files.
+   - To navigate by entry tags
+
+  Consider supporting KeePass 2.x style entry history.
+   - There are potential security implications in File::KeePass.
+   - Related, consider adding a purge command for that history.
+
+  Consider adding KeePass 2.x style multi-user synchronization.
 
   Consider http://search.cpan.org/~sherwin/Data-Password-passwdqc/
   for password quality checking.
 
-  Consider adding searches for expired entries and possibly also for
-  created, modified, and access times older than a user supplied time.
+  Consider adding searches for created, modified, and accessed times
+  older than a user supplied time.
 
   Consider adding import support for Password Safe v3 files using
   http://search.cpan.org/~tlinden/Crypt-PWSafe3/. May have already
@@ -3715,7 +4747,8 @@ this program would not have been practical for me to author.
 Unix-like
  - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
  - As of version 2.5, development is done on Linux Mint 16.
- - Known to work on many other Linux and *BSD distributions.
+ - Known to work on many other Linux and *BSD distributions, and
+   kpcli is packaged with many distributions now-a-days.
 
 Microsoft Windows
  - As of v2.4, Microsoft Windows is also supported.
