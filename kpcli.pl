@@ -74,6 +74,7 @@ if (lc($OSNAME) =~ m/^mswin/) {
     *colored = sub { my $color = shift @_; my $text=shift @_; return $text; };
   }
 }
+runtime_load_module(\%OPTIONAL_PM,'Sub::Install',undef);
 
 $|=1; # flush immediately after writes or prints to STDOUT
 
@@ -90,7 +91,7 @@ my $MAX_ATTACH_SIZE = 2*1024**2; # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "2.7";
+my $VERSION = "2.8";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -116,15 +117,6 @@ my $term = new Term::ShellUI(
     history_file => $HISTORY_FILE,
     keep_quotes => 0,
     commands => {
-         #"" => { args => sub { shift->complete_history(@_) } },
-         "history" => { desc => "Prints the command history",
-            doc => "\nSpecify a number to list the last N lines of history.\n" .
-            "Pass -c to clear the command history.\n" .
-            "Pass -d NUM to delete a single item.\n",
-            args => "[-c] [-d] [number]",
-            method => sub { shift->history_call(@_) },
-	    exclude_from_history => 1,
-         },
          "ver" => {
              desc => "Print the version of this program",
              doc => "\n" .
@@ -135,39 +127,39 @@ my $term = new Term::ShellUI(
              method => \&cli_version,
              minargs => 0, maxargs => 1,
 	     exclude_from_history => 1,
+             timeout_exempt => 1,
          },
          "version" => { alias => "ver",
-		exclude_from_completion=>1, exclude_from_history => 1,},
+             exclude_from_completion=>1, exclude_from_history => 1,
+             timeout_exempt => 1,
+         },
          "vers" => {
              desc => "Same as \"ver -v\"",
              minargs => 0, maxargs => 0,
              method => sub { cli_version(shift, { args => ['-v'] }); },
-		exclude_from_completion=>1, exclude_from_history => 1,
+             exclude_from_completion=>1, exclude_from_history => 1,
+             timeout_exempt => 1,
          },
          "versions" => { alias => "vers",
-		exclude_from_completion=>1, exclude_from_history => 1,},
+             exclude_from_completion=>1, exclude_from_history => 1,
+             timeout_exempt => 1,
+         },
          "help" => {
              desc => "Print helpful information",
              args => sub { shift->help_args(undef, @_); },
              method => sub { my_help_call(@_); },
 	     exclude_from_history => 1,
+             timeout_exempt => 1,
              #method => sub { shift->help_call(undef, @_); }
          },
          "h" => { alias => "help",
-		exclude_from_completion=>1, exclude_from_history => 1,},
+             exclude_from_completion=>1, exclude_from_history => 1,
+             timeout_exempt => 1,
+		},
          "?" => { alias => "help",
-		exclude_from_completion=>1, exclude_from_history => 1,},
-         "cl" => {
-             desc => "Change directory and list entries (cd+ls)",
-             doc => "\n" .
-		"Change the pwd to an absolute or relative path\n" .
-		"and list the entries there. This is a useful way\n" .
-		"to quickly navigate to a path and have the entries\n" .
-		"listed in preparation to run the show command.\n",
-             maxargs => 1,
-             args => \&complete_groups,
-             method => sub { if(cli_cd(@_) == 0) { cli_ls() } },
-         },
+             exclude_from_completion=>1, exclude_from_history => 1,
+             timeout_exempt => 1,
+		},
 	 "cls" => {
 	     desc => 'Clear screen ("clear" command also works)',
 	     doc  => "\n" .
@@ -175,8 +167,29 @@ my $term = new Term::ShellUI(
 	     maxargs => 0,
 	     method => \&cli_cls,
 	     exclude_from_history => 1,
+             timeout_exempt => 1,
 	 },
-         "clear" => { alias => "cls", exclude_from_history => 1, },
+         "clear" => { alias => "cls", exclude_from_history => 1,
+						timeout_exempt => 1, },
+         "quit" => {
+             desc => "Quit this program (EOF and exit also work)",
+             maxargs => 0,
+             method => sub { run_no_TSTP(\&cli_quit, @_); },
+	     exclude_from_history => 1,
+             timeout_exempt => 1,
+         },
+         "exit" => { alias => "quit", exclude_from_history => 1,
+						timeout_exempt => 1, },
+         # Generally, commands above here are timeout_exempt
+         #"" => { args => sub { shift->complete_history(@_) } },
+         "history" => { desc => "Prints the command history",
+            doc => "\nSpecify a number to list the last N lines of history.\n" .
+            "Pass -c to clear the command history.\n" .
+            "Pass -d NUM to delete a single item.\n",
+            args => "[-c] [-d] [number]",
+            method => sub { shift->history_call(@_) },
+	    exclude_from_history => 1,
+         },
          "cd" => {
              desc => "Change directory (path to a group)",
              doc => "\n" .
@@ -188,6 +201,17 @@ my $term = new Term::ShellUI(
              method => \&cli_cd,
          },
          "chdir" => { alias => 'cd' },
+         "cl" => {
+             desc => "Change directory and list entries (cd+ls)",
+             doc => "\n" .
+		"Change the pwd to an absolute or relative path\n" .
+		"and list the entries there. This is a useful way\n" .
+		"to quickly navigate to a path and have the entries\n" .
+		"listed in preparation to run the show command.\n",
+             maxargs => 1,
+             args => \&complete_groups,
+             method => sub { if(cli_cd(@_) == 0) { cli_ls() } },
+         },
          "saveas" => {
              desc => "Save to a specific filename " .
 				"(saveas <file.kdb> [<file.key>])",
@@ -245,10 +269,10 @@ my $term = new Term::ShellUI(
          },
          "dir" => { alias => "ls", },
          "ls" => {
-             desc => "Lists items in the pwd or a specified path " .
+             desc => "Lists items in the pwd or specified paths " .
 							"(\"dir\" also works)",
              minargs => 0, maxargs => 99,
-             args => \&complete_groups,
+             args => \&complete_groups_and_entries,
              method => \&cli_ls,
          },
          "new" => {
@@ -355,7 +379,7 @@ my $term = new Term::ShellUI(
              method => sub { run_no_TSTP(\&cli_attach, @_); },
          },
          "mv" => {
-             desc => "Move an item: mv <path to group|entry> <path to group>",
+             desc => "Move an item: mv <path to a group|or entries> <path to group>",
              minargs => 2, maxargs => 2,
              args => [\&complete_groups_and_entries, \&complete_groups],
              method => \&cli_mv,
@@ -416,13 +440,6 @@ my $term = new Term::ShellUI(
              maxargs => 0,
              proc => sub { run_no_TSTP(\&cli_icons, @_); },
          },
-         "quit" => {
-             desc => "Quit this program (EOF and exit also work)",
-             maxargs => 0,
-             method => sub { run_no_TSTP(\&cli_quit, @_); },
-	     exclude_from_history => 1,
-         },
-         "exit" => { alias => "quit", exclude_from_history => 1,}
        },
     );
 $term->prompt(\&term_set_prompt);
@@ -433,9 +450,10 @@ our $state={
 	'term' => $term,
 	'OPTIONAL_PM' => \%OPTIONAL_PM,
 	'kdb_has_changed' => 0,
-	'last_ls_path' => '',
+	'last_ls_ents' => [], # Array of entries last listed to the user.
 	'put_master_passwd' => \&put_master_passwd,
 	'get_master_passwd' => \&get_master_passwd,
+	'last_activity_time' => 0, # initilized by setup_timeout_handling()
 	};
 # If given --kdb=, open that file
 if (length($opts->{kdb})) {
@@ -470,7 +488,16 @@ if (Term::ShellUI->can('add_eof_exit_hook')) {
 }
 print "\n";
 
-setup_signal_handling(); # Exactly what the name indicates...
+setup_signal_handling();  # Exactly what the name indicates...
+
+# Setup the inactivity timeout feature (--timeout).
+if (defined($opts->{timeout}) && int($opts->{timeout}) > 0) {
+  if  (! $state->{OPTIONAL_PM}->{'Sub::Install'}->{loaded}) {
+    print "Error: --timeout requires the Sub::Install module.\n";
+    exit;
+  }
+  setup_timeout_handling();
+}
 
 $term->run();
 
@@ -523,6 +550,14 @@ sub open_kdb {
   if ($state->{placed_lock_file}) {
     touch_file($state->{placed_lock_file});
   }
+
+  # We hold a read file handle open for no reason other than
+  # to show up in lsof.
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
+  $state->{kdb_file_handle} = new FileHandle;
+  open($state->{kdb_file_handle}, '<', $file);
 
   $state->{kdb_file} = $file;
   $state->{key_file} = $key_file;
@@ -984,6 +1019,10 @@ sub normalize_path_string($) {
   my $path_string = shift @_;
   our $state;
 
+  if ($path_string =~ m/\0/) {
+    warn "normalize_path_string(\"$path_string\"): path contains a NULL. Likely a bug.\nPlease report it at https://sourceforge.net/p/kpcli/bugs/!\n";
+  }
+
   # Split the path into @path
   # http://efreedom.com/Question/1-3588341/Implement-Escape-Sequence-Using-Split-Perl
   my $delim="/";
@@ -1178,8 +1217,8 @@ sub cli_find($) {
     # safe because we are adding it to entries in the /_found group which
     # will not be saved to a file.
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
-    $new_ent{path} = '/' . dirname(humanize_path($nulled_path)) . '/';
     $new_ent{full_path} = '/' . humanize_path($nulled_path);
+    $new_ent{path} = dirname($new_ent{full_path}) . '/';
     if (defined($duplicates{$new_ent{full_path}})) { next FINDS; }
     $duplicates{$new_ent{full_path}} = 1;
     $k->add_entry(\%new_ent);
@@ -1214,6 +1253,13 @@ sub cli_find($) {
       # expired time, and so we add -a here.
       if (defined($opts{'expired'})) { push @{$show_args}, '-a'; }
       cli_show($self, { args => $show_args });
+    }
+  } elsif (scalar(@matches) > 1) {
+    print "Would you like to list them now? [y/N] ";
+    my $key=get_single_key();
+    print "\n";
+    if (lc($key) eq 'y') {
+      cli_ls($self,{"args" => ["/$FOUND_DIR/"]});
     }
   }
 }
@@ -1320,9 +1366,17 @@ sub cli_save($) {
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
   print "Saved to $state->{kdb_file}\n";
   $k->lock;
+  my $file = $state->{kdb_file};
+
+  # We hold a read file handle open for no reason other than
+  # to show up in lsof.
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
+  $state->{kdb_file_handle} = new FileHandle;
+  open($state->{kdb_file_handle}, '<', $file);
 
   # Update the md5sum of the file after we just saved it
-  my $file = $state->{kdb_file};
   $state->{kdb_file_md5} = Digest::file::digest_file_hex($file, "MD5");
 }
 
@@ -1445,8 +1499,8 @@ return 0;
 }
 
 # This routine takes one parameter that will be either a path
-# to an entity or an entity number as shown my the ls command
-# and will use $state information such as last_ls_path to
+# to an entity or an entity number as shown by the ls command
+# and will use $state information such as last_ls_ents to
 # return a reference to that entity in the $state-{kdb} database,
 # if possible (valid input).
 sub find_target_entity_by_number_or_path($) {
@@ -1455,15 +1509,10 @@ sub find_target_entity_by_number_or_path($) {
 
   my $ent=undef; # hope to populate this in a second...
 
-
   # This section looks for an entity by an "ls" number
-  if ($target =~ m/^[0-9]+$/) {
-    my $path=$state->{last_ls_path};
-    if (!length($path)) { $path=get_pwd(); }
-    if (! validate_entry_number($target,$path)) {
-      my ($rGrps,$rEnts) = get_groups_and_entries($path);
-      $ent=$rEnts->[$target];
-    }
+  if ($target =~ m/^[0-9]+$/ && scalar(@{$state->{last_ls_ents}}) > 0
+			&& $target < scalar(@{$state->{last_ls_ents}}) ) {
+    return @{$state->{last_ls_ents}}[$target];
   }
 
   # This section looks by a path name
@@ -1473,12 +1522,16 @@ sub find_target_entity_by_number_or_path($) {
   }
 
   # If we found the entry, place the path to this entry in the entry record,
-  # if it's not already there _and_ if the path we have != $FOUND_DIR.
-  if (defined($ent) &&
-	(!defined($ent->{path})) && $ent->{path} !~ m/^\Q$FOUND_DIR\E$/) {
-    $ent->{full_path} = '/' .
+  # even if it's already there (it may have just changed via cli_mv), if the
+  # path we have for this entity is not the $FOUND_DIR.
+  if (defined($ent)) {
+    my $full_path = '/' .
 		humanize_path($state->{all_ent_paths_rev}->{$ent->{id}});
-    $ent->{path} = dirname($ent->{full_path});
+    my $path = dirname($full_path) . '/';
+    if ("/$FOUND_DIR/" ne $path) {
+      $ent->{full_path} = $full_path;
+      $ent->{path} = $path;
+    }
   }
 
   return $ent;
@@ -1537,9 +1590,12 @@ sub cli_rename($$) {
   RequestSaveOnDBChange();
 }
 
-sub cli_mv($$) {
+sub cli_mv {
   my $self = shift @_;
   my $params = shift @_;
+  my $src_path = shift @_;
+  my $target_dir = shift @_;
+  my $skip_save = shift @_ || 0;
   our $state;
 
   if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
@@ -1547,7 +1603,6 @@ sub cli_mv($$) {
   }
 
   # The target has to be a group. We start validation there (the target).
-  my $target_dir = $params->{args}->[1];
   my $dir_normalized=normalize_path_string($target_dir);
   my $grp=undef;
   if (defined($state->{all_grp_paths_fwd}->{$dir_normalized})) {
@@ -1559,17 +1614,29 @@ sub cli_mv($$) {
     return -1;
   }
 
-  # The source (thing we are moving) can be an entity or group, and
-  # here we figure out which one and prepare to exectute the move below.
-  my $src_path = normalize_path_string($params->{args}->[0]);
+  # The source (thing we are moving) can be an entity, group, or a
+  # shell_expansion. Here we figure out which one and prepare to
+  # exectute the move(s) below.
   my $ent=undef;
   my $mv_type = undef;
   if ($ent=find_target_entity_by_number_or_path($src_path)) {
     $mv_type = 'entry';
-  } elsif (defined($state->{all_grp_paths_fwd}->{$src_path})) {
+  } elsif (defined($state->{all_grp_paths_fwd}->{normalize_path_string($src_path)})) {
     $mv_type = 'group';
   } else {
-    print "Unknown entity: $src_path\n";
+    # For shell_expansion moves, we call cli_mv for each shell_expansion item,
+    # with skip_save set to true.
+    my @ent_matches = shell_expansion($src_path);
+    if (scalar(@ent_matches) > 0) {
+      $mv_type = 'shell_expansion';
+      foreach my $mv_src (@ent_matches) {
+        my $skip_save = 1;
+        cli_mv($self,$params,'/'.humanize_path($mv_src),$target_dir,$skip_save);
+      }
+    }
+  }
+  if (! defined($mv_type)) {
+    print "Unknown entity: " . humanize_path($src_path) . "\n";
     return -1;
   }
 
@@ -1577,9 +1644,10 @@ sub cli_mv($$) {
   if ($mv_type eq 'entry') {
     # Verify no entry title conflict at the new location
     my $new_entry_path=normalize_path_string($target_dir . "/" . $ent->{title});
-    if (defined($state->{all_ent_paths_fwd}->{$new_entry_path})) {
+    if (defined($state->{all_ent_paths_fwd}->{$new_entry_path}) ||
+		defined($state->{all_grp_paths_fwd}->{$new_entry_path})) {
       my $path = dirname(humanize_path($new_entry_path));
-      print "There is already and entry named \"$ent->{title}\" at $path/.\n";
+      print "ERROR: already an item named \"$ent->{title}\" at $path/.\n";
       return undef;
     }
 
@@ -1593,10 +1661,19 @@ sub cli_mv($$) {
       $state->{kdb}->delete_entry({ id=>$ent->{id} });
     }
     $state->{kdb}->lock;
+    print "Moved \"$ent->{title}\" to ".dirname(humanize_path($new_entry_path))."/\n";
   } elsif ($mv_type eq 'group') {
     # Find the group that the user is asking us to move
     my $src_grp=$state->{kdb}->find_group(
-			{id => $state->{all_grp_paths_fwd}->{$src_path}});
+			{id => $state->{all_grp_paths_fwd}->{normalize_path_string($src_path)}});
+    my $new_group_path=normalize_path_string($target_dir . "/" . $src_grp->{title});
+    if (defined($state->{all_grp_paths_fwd}->{$new_group_path}) ||
+		defined($state->{all_ent_paths_fwd}->{$new_group_path})) {
+      my $path = dirname(humanize_path($new_group_path));
+      print "ERROR: already an item named \"$src_grp->{title}\" at $path/.\n";
+      return undef;
+    }
+
     # Clone the group that is to be moved
     my %new_group = %{$src_grp};
     # Delete the id and level from the cloned group
@@ -1608,20 +1685,25 @@ sub cli_mv($$) {
     $state->{kdb}->add_group(\%new_group);
     # Delete the original group that we just cloned into a new spot
     $state->{kdb}->delete_group({ id => $src_grp->{id} });
-  } else {
+    print "Moved \"$src_grp->{title}/\" to ".dirname(humanize_path($new_group_path))."/\n";
+  } elsif ($mv_type ne 'shell_expansion') {
     print "Unknown error with move command.\n";
     return -1;
   }
 
   # Because we moved an entry we must refresh our $state paths
-  refresh_state_all_paths();
-  $state->{kdb_has_changed}=1;
-  RequestSaveOnDBChange();
+  if (! $skip_save) {
+    refresh_state_all_paths();
+    $state->{kdb_has_changed}=1;
+    RequestSaveOnDBChange();
+  }
 }
 
 sub cli_copy {
   my $self = shift @_;
   my $params = shift @_;
+  my $src = shift @_;
+  my $dst = shift @_;
   my $skip_save = shift @_ || 0;
   our $state;
 
@@ -1629,14 +1711,14 @@ sub cli_copy {
     return;
   }
 
-  my $source_ent = $params->{args}->[0];
+  my $source_ent = $src;
   my $src_ent=find_target_entity_by_number_or_path($source_ent);
   if (! defined($src_ent)) {
     print "Unknown entry: $source_ent\n";
     return -1;
   }
 
-  my $target_ent = $params->{args}->[1];
+  my $target_ent = $dst;
   my $trg_ent=find_target_entity_by_number_or_path($target_ent);
   if (defined($trg_ent)) {
     print "Copy cannot overwrite an existing entry.\n";
@@ -1679,7 +1761,8 @@ sub cli_copy {
 sub cli_clone($$) {
   my $self = shift @_;
   my $params = shift @_;
-  my $skip_save = shift @_ || 0;
+  my $src = shift @_;
+  my $dst = shift @_;
   our $state;
 
   if (recent_sigint() || deny_if_readonly() || warn_if_file_changed()) {
@@ -1687,7 +1770,7 @@ sub cli_clone($$) {
   }
 
   my $skip_save = 1;
-  my $retval_copy = cli_copy($self, $params, $skip_save);
+  my $retval_copy = cli_copy($self, $params, $src, $dst, $skip_save);
   if ($retval_copy) {
     return -1;
   }
@@ -1852,6 +1935,23 @@ sub cli_edit {
   if (! defined($ent)) {
     print "Don't see an entry at path: $target\n";
     return -1;
+  }
+  # Protect users from editing in the $FOUND_DIR.
+  my $ent_path = $state->{all_ent_paths_rev}->{$ent->{id}};
+  if ($ent_path =~ m/^\Q$FOUND_DIR\E/) {
+    print color('yellow')
+	. "That entity is in the temporary /$FOUND_DIR dir.\n"
+	. color('clear');
+    my $real_path = $ent->{full_path};
+    my $real_ent = find_target_entity_by_number_or_path($real_path);
+    if (defined($real_ent)) {
+      print "Would you rather edit $real_path? [y/N]";
+      my $key=get_single_key();
+      print "\n";
+      if (lc($key) eq 'y') {
+        $ent = $real_ent;
+      }
+    }
   }
 
   my %changes = ();
@@ -2784,6 +2884,16 @@ sub cli_saveas($) {
 			composite_master_pass($master_pass,$key_file)) }) {
     die "Couldn't load the file $file: $@";
   }
+
+  # We hold a read file handle open for no reason other than
+  # to show up in lsof.
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
+  $state->{kdb_file_handle} = new FileHandle;
+  open($state->{kdb_file_handle}, '<', $file);
+
+  $state->{kdb_file} = $file;
   $state->{kdb_has_changed}=0;
   $state->{kdb_file} = $file;
   $state->{key_file} = $key_file;
@@ -3010,6 +3120,9 @@ sub cli_close {
 
   $state->{'kdb'}->clear();
   new_kdb($state);
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
   return 0;
 }
 
@@ -3032,10 +3145,13 @@ sub new_kdb {
   cli_cd($term, {'args' => ["/"]});
 }
 
-sub cli_ls($$) {
+
+sub cli_ls {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+
+  $state->{last_ls_ents} = []; # We reload this state in this function
 
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
@@ -3044,46 +3160,89 @@ sub cli_ls($$) {
 				ref($params->{'args'}) eq 'ARRAY') {
     @paths = @{$params->{'args'}};
   }
-  if (scalar(@paths) == 0) { push @paths, ''; }
+  if (scalar(@paths) == 0) { push @paths, get_pwd(); }
   my $paths_count = scalar(@paths);
-  my $loops=0;
+  my @ent_matches = (); # Collects entries we've been directly asked to list
+  my @grp_paths = ();	# Collects groups we've been asked to list
+  my $k=$state->{kdb};
   foreach my $path (@paths) {
-    # If multiple dirs are being listed, title each
-    if ($paths_count > 1) {
-      $path =~ s/\/+$//; print "$path/:\n";
-    }
-
-    # If we were given a path, use cli_cd() to go there temporarily...
-    my $old_path='';
-    if (length($path)) {
-      $old_path=get_pwd();
-      if (cli_cd($term, {'args' => [$path]})) {
-        return -1; # If cli_cd() returned non-zero it failed
+    my $norm_path = normalize_path_string($path);
+    if (defined($state->{all_grp_paths_fwd}->{$norm_path}) || length($norm_path) < 1) {
+      push @grp_paths, $path;
+    } elsif (defined($state->{all_ent_paths_fwd}->{$norm_path})) {
+      my $tmp_ent = $k->find_entry({id=>$state->{all_ent_paths_fwd}->{$norm_path}});
+      push @ent_matches, $tmp_ent;
+    } else {
+      my @tmp_ents = shell_expansion($path);
+      foreach my $tmp_ent (@tmp_ents) {
+        if (defined($state->{all_ent_paths_fwd}->{$tmp_ent})) {
+          my $entry_id = $state->{all_ent_paths_fwd}->{$tmp_ent};
+          my $ent = $state->{kdb}->find_entry( {id=>$entry_id} );
+          push @ent_matches, $ent;
+        } elsif (defined($state->{all_grp_paths_fwd}->{$tmp_ent})) {
+          push @grp_paths, '/'.humanize_path($tmp_ent);
+        }
       }
     }
+  }
 
-    # List the pwd
-    $state->{last_ls_path} = get_pwd();
-    my ($rGrps,$rEnts) = get_current_groups_and_entries();
-    if (scalar(@{$rGrps}) > 0) {
+  my $have_output=0; # Helps manage "\n" placements below.
+
+  # First present the entries that we were directly asked to list
+  if (scalar(@ent_matches) > 0) {
+    @ent_matches = sort { ncmp($a->{title},$b->{title}); } @ent_matches;
+    if ($have_output) { print "\n"; }
+    print "=== Entries ===\n";
+    print join("\n", @{get_human_entry_list(\@ent_matches, scalar(@{$state->{last_ls_ents}}))}) ."\n";
+    push @{$state->{last_ls_ents}}, @ent_matches;
+    $have_output++;
+  }
+
+  # Now present the groups that we were asked to list
+  foreach my $path (sort { ncmp($a,$b) } @grp_paths) {
+    my $norm_path = normalize_path_string($path);
+    if ($have_output) { print "\n"; }
+    if (scalar(@ent_matches) > 0 || scalar(@grp_paths) > 1) {
+      print "$path:\n";
+      $have_output++;
+    }
+    my @groups = (); my @entries = ();
+    if (length($norm_path) < 1) {
+      @groups = $k->find_groups({level=>0});
+      @entries = $k->find_entries({level => 0});
+    } else {
+      my $group_id = $state->{all_grp_paths_fwd}->{$norm_path};
+      @entries = $k->find_entries({group_id=>$group_id});
+      @entries = sort { ncmp($a->{title},$b->{title}); } @entries;
+      my $this_grp = $k->find_group({id=>$group_id});
+      if (defined($this_grp->{groups})) {
+        @groups = sort group_sort @{$this_grp->{groups}};
+      }
+    }
+    # Eliminate "system" entries inside this group that we don't want to show
+    my @good_entries = ();
+    MATCHES: foreach my $ent (@entries) {
+      #my $ent = $k->find_entry({id=>$state->{all_ent_paths_fwd}->{$match}});
+      if (defined($ent) && $ent->{'title'} eq 'Meta-Info' && $ent->{'username'} eq 'SYSTEM') {
+        next MATCHES;
+      }
+      push @good_entries, $ent;
+    }
+    @entries = @good_entries;
+    # Display the groups and entries that we have
+    if (scalar(@groups) > 0) {
       print "=== Groups ===\n";
-      print join("\n", @{get_human_group_list($rGrps)}) . "\n";
+      print join("\n", @{get_human_group_list(\@groups)}) . "\n";
+      $have_output++;
     }
-    if (scalar(@{$rEnts}) > 0) {
+    if (scalar(@entries) > 0) {
       print "=== Entries ===\n";
-      print join("\n", @{get_human_entry_list($rEnts)}) . "\n";
-    }
-
-    # If we temporarily cd'ed, cd back.
-    if (length($old_path)) {
-      cli_cd($term, {'args' => [$old_path]});
-    }
-
-    # If printing multiple dirs, we need to append a \n to all but the last
-    if ($paths_count > 1 && ++$loops < $paths_count) {
-      print "\n";
+      print join("\n", @{get_human_entry_list(\@entries, scalar(@{$state->{last_ls_ents}}))}) . "\n";
+      $have_output++;
+      push @{$state->{last_ls_ents}}, @entries;
     }
   }
+
   return 0;
 }
 
@@ -3100,17 +3259,18 @@ sub get_human_group_list($) {
 }
 
 # Helper function for cli_ls()
-sub get_human_entry_list($) {
+sub get_human_entry_list {
   my $rEntries=shift @_;
+  my $start_num = shift @_ || 0;
   my @list=();
   my $i=0;
-  my $d_len=int((scalar(@{$rEntries}) - 1) / 10) + 1;
+  my $d_len = length(scalar(@{$rEntries}) - 1 + $start_num);
   foreach my $ent (@{$rEntries}) {
     my $url=$ent->{url};
     $url=~s/^https?:\/\///i;
     $url=~s/\/+$//;
     push (@list, sprintf("%".$d_len."d. %-40.40s %30.30s",
-						$i, $ent->{title}, $url));
+				$i + $start_num, $ent->{title}, $url));
     $i++;
   }
   return \@list;
@@ -3618,7 +3778,7 @@ sub GetPassword {
 sub MyGetOpts {
   my %opts=();
   my $result = &GetOptions(\%opts, "kdb=s", "key=s", "histfile=s",
-				"help", "h", "readonly", "no-recycle");
+		"help", "h", "readonly", "no-recycle", "timeout=i");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -3661,6 +3821,7 @@ sub GetUsageMessage {
     [ key => 'Optional KeePass key file (must exist).' ],
     [ histfile => 'Specify your history file (or perhaps /dev/null).' ],
     [ readonly => 'Run in read-only mode; no changes will be allowed.' ],
+    [ "timeout=i" => 'Lock interface after i seconds of inactivity.' ],
     [ 'no-recycle' =>
 		'Don\'t store entry changes in /Backup or "/Recycle Bin".' ],
     [ help => 'This message.' ],
@@ -4181,6 +4342,42 @@ sub generatePasswordFromDict($) {
   return $password;
 }
 
+# Adapted from http://docstore.mik.ua/orelly/perl/cookbook/ch06_10.htm
+sub glob2pat {
+    my $globstr = shift;
+    my %patmap = (
+        '*' => '[^\0]*',
+        '?' => '[^\0]',
+        '[' => '[',
+        ']' => ']',
+    );
+    $globstr =~ s{(.)} { $patmap{$1} || "\Q$1" }ge;
+    return '^' . $globstr . '$';
+}
+
+sub shell_expansion($) {
+  my $shell_path = shift @_;
+  our $state;
+  my $regex = glob2pat(normalize_path_string($shell_path));
+  $regex = qr/$regex/;
+  my @grps_and_ents = ();
+  push @grps_and_ents, keys %{$state->{all_ent_paths_fwd}};
+  push @grps_and_ents, keys %{$state->{all_grp_paths_fwd}};
+  @grps_and_ents = sort { ncmp($a,$b); } @grps_and_ents;
+  my @matches = grep(/${regex}/, @grps_and_ents);
+  # Eliminate "system" things that we don't want to include
+  my @good_matches = ();
+  MATCHES: foreach my $match (@matches) {
+    if (defined($state->{all_ent_paths_fwd}->{$match})) {
+      my $ent = $state->{kdb}->find_entry({id=>$state->{all_ent_paths_fwd}->{$match}});
+      if (defined($ent) && $ent->{'title'} eq 'Meta-Info' && $ent->{'username'} eq 'SYSTEM') {
+        next MATCHES;
+      }
+    }
+    push @good_matches, $match;
+  }
+  return @good_matches;
+}
 
 #########################################################################
 # Setup signal handling #################################################
@@ -4275,6 +4472,55 @@ sub setup_signal_handling {
   };
   sigaction(SIGCONT, new POSIX::SigAction($handler_SIGCONT));
   #$SIG{CONT} = $handler_SIGCONT; # Works only if $ENV{PERL_SIGNAL}='unsafe'
+}
+
+#########################################################################
+# Setup timeout handling (--timeout=N) ##################################
+#########################################################################
+sub setup_timeout_handling {
+  our $state;
+  $state->{last_activity_time}=time;
+  our $def_call_command = \&Term::ShellUI::call_command;
+  if ($state->{OPTIONAL_PM}->{'Sub::Install'}->{loaded}) {
+    Sub::Install::reinstall_sub({
+      into => "Term::ShellUI",
+      as   => 'call_command',
+      code =>
+        sub {
+          our $state;
+          my $self = $_[0];
+          my $parms = $_[1];
+          my $cmd = $self->get_cname($parms->{cname});
+          my $idletime = abs($state->{last_activity_time} - time);
+          my $timeout_exempt=0;
+          my $all_commands = $self->commands();
+          if (defined($all_commands->{$cmd}) &&
+		defined($all_commands->{$cmd}->{timeout_exempt}) &&
+		$all_commands->{$cmd}->{timeout_exempt}) {
+            $timeout_exempt=1;
+          }
+          if (defined($state->{kdb_file}) && length($state->{kdb_file}) &&
+		($timeout_exempt == 0) && ($idletime > $opts->{timeout})) {
+            print "You were idle for more than $opts->{timeout} seconds...\n";
+            # GetMasterPasswd()=from user; get_master_passwd()=for kdb file
+            if (GetMasterPasswd() ne get_master_passwd()) {
+              print "Wrong password.\n";
+              return -1;
+            }
+            $idletime = 0; # Reset idle time on successful password.
+          }
+          # Update the state->{last_activity_time} only if not already past
+          # the timeout; the command could have been one one of the the
+          # timeout_exempt ones, as defined in main Term::SehllUI data.
+          if ($idletime <= $opts->{timeout}) {
+            $state->{last_activity_time}=time;
+          }
+          # Call Term::ShellUI::call_command()
+          our $def_call_command;
+          return &$def_call_command(@_);
+        },
+    });
+  }
 }
 
 # Code consolidation function to runtime-load optional perl modules
@@ -4716,8 +4962,20 @@ this program would not have been practical for me to author.
                     Fixed bug with SIGTSTP handling (^Z presses).
                     Fixed missing refresh_state_all_paths() in cli_rm.
  2014-Jun-11 v2.7 - Bug fix release. Broke the open command in 2.6.
+ 2015-Feb-08 v2.8 - Fixed cli_copy bug; refresh paths and ask to save.
+                    Fixed a cli_mv bug; double path-normalization.
+                    Fixed a path display bug, if done after a cli_mv.
+                    Protect users from editing in the $FOUND_DIR.
+                    Keep file opened, read-only, to show up in lsof.
+                    Added inactivity locking (--timeout parameter).
+                    Added shell expansion support to cli_ls, with the
+                     ability to manage _all_ listed entries by number.
+                    Added shell expansion support to cli_mv.
+                    Added [y/N] option to list entries after a find.
 
 =head1 TODO ITEMS
+
+  Consider broadening shell_expansion support beyond just mv and ls.
 
   Consider adding a purge command for "Backup"/"Recycle Bin" folders.
 
