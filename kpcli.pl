@@ -39,6 +39,13 @@ use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
 use Term::ShellUI;           # non-core, libterm-shellui-perl on Ubuntu
 use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
                              #  - >=v0.03 needed due critical bug fixes
+
+# A developer convenience to force using a particular Term::ReadLine module
+our $FORCED_READLINE = undef;	# Auto-select
+#our $FORCED_READLINE = 'Term::ReadLine::Gnu';
+#our $FORCED_READLINE = 'Term::ReadLine::Perl';
+#our $FORCED_READLINE = 'Term::ReadLine::Perl5';
+
 # Pull in optional perl modules with run-time loading
 my %OPTIONAL_PM=();
 # Data::Password is needed for the pwck command (check password quality).
@@ -91,7 +98,7 @@ my $MAX_ATTACH_SIZE = 2*1024**2; # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "2.8";
+my $VERSION = "3.0";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -237,11 +244,13 @@ my $term = new Term::ShellUI(
              proc => sub { run_no_TSTP(\&cli_export, @_); },
          },
          "import" => {
-             desc => "Import another KeePass DB " .
-				"(import <file.kdb> <path> [<file.key>])",
+             desc => "Import a password database " .
+				"(import <file> <path> [<file.key>])",
              doc => "\n" .
-		"Use this command to import the entire KeePass DB\n" .
-		"specified by <file.kdb> into a new group at <path>.\n",
+		"Use this command to import an entire password DB\n" .
+		"specified by <file> into a new group at <path>.\n" .
+		"Supported file types are KeePass v1 and v2, and\n" .
+		"Password Safe v3 (http://passwordsafe.sf.net).\n",
              minargs => 2, maxargs => 3,
              args => [\&Term::ShellUI::complete_files,\&complete_groups,
 					\&Term::ShellUI::complete_files],
@@ -1891,7 +1900,7 @@ sub show_helper_files_strings {
 	'strings' => ['Strgs','String Values'],
 	};
   my @atts=();
-  if (defined($ent->{$key})) {
+  if (defined($ent->{$key}) && ref($ent->{$key}) eq 'HASH') {
     foreach my $name (sort keys %{$ent->{$key}}) {
       if ($key eq 'binary') {
         push @atts, "$name (". int(length($ent->{$key}->{$name})) ." bytes)";
@@ -2621,8 +2630,9 @@ sub cli_import {
     print "File does not exist: $file\n";
     return -1;
   }
-  if (magic_file_type($file) ne 'keepass') {
-    print "Does not appear to be a KeePass file: $file\n";
+  my $import_file_type = magic_file_type($file);
+  if (scalar(grep(/^$import_file_type$/, qw(keepass pws3))) != 1) {
+    print "Does not appear to be a KeePass or Password Safe v3 file: $file\n";
     return -1;
   }
   # If the $new_group_path is a relative path, make it absolute
@@ -2649,6 +2659,120 @@ sub cli_import {
   # Ask the user for the master password and then open the kdb
   my $master_pass=GetMasterPasswd();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
+  if ($import_file_type eq 'keepass') {
+    return cli_import_keepass($file,
+			$master_pass,$key_file,$grp_name,$parent_group);
+  } elsif ($import_file_type eq 'pws3') {
+    return cli_import_pwsafe3($file,
+			$master_pass,$key_file,$grp_name,$parent_group);
+  } else {
+    print "Unsupported file type for import.\n";
+    return -1;
+  }
+}
+
+sub cli_import_pwsafe3 {
+  my $file = shift @_;
+  my $master_pass = shift @_;
+  my $key_file = shift @_;
+  my $grp_name = shift @_;
+  my $parent_group = shift @_;
+  our $state;
+
+  # This requires Crypt::PWSafe3 so try to load it if we don't have it
+  if  (! $state->{OPTIONAL_PM}->{'Crypt::PWSafe3'}->{loaded}) {
+    runtime_load_module(\%OPTIONAL_PM,'Crypt::PWSafe3',[qw(capture)]);
+  }
+  if  (! $state->{OPTIONAL_PM}->{'Crypt::PWSafe3'}->{loaded}) {
+    print "Perl module Crypt::PWSafe3 is required for this functionality.\n";
+    return -1;
+  }
+
+  # The eval is needed to catch the output of Carp::croak from Crypt::PWSafe3
+  my $pws3;
+  eval { $pws3 = new Crypt::PWSafe3(file => $file,
+			password => $master_pass, program  => $APP_NAME); };
+  if ($@ || ref($pws3) ne 'Crypt::PWSafe3') {
+    print "Failed to load $file.";
+    if ($@ =~ m/^Wrong password/i) {
+      print " Wrong password.\n";
+    } else {
+      print "Error: $@\n";
+    }
+    return -1;
+  }
+  my @records = $pws3->getrecords();
+  if (scalar(@records) < 1) { print "No records to import.\n"; return -1; }
+  # Find any groups in the pws3 file that we need to create, and make them
+  my @groups = ();
+  foreach my $record (@records) { push @groups, $record->group(); }
+  @groups = grep(!/^$/, @groups); # eliminate the top-level (empty) group
+
+  # Add the new group, to its parent or to root if $parent_group==undef
+  my $k=$state->{kdb};
+  my $new_group=$k->add_group({
+	title => $grp_name,
+	group => $parent_group,
+	});
+  # %new_groups will hold new groups that we add during this import,
+  # indexed by the PWSafe3 group name, like "foo.bar.baz"
+  my %new_groups = ();
+  $new_groups{""} = $new_group; # Top level group for this import
+
+  @groups = sort(uniq(@groups)); # sort is critical to the algorithm just below
+  #print "LHHD: " . &Dumper(\@groups) . "\n";
+  foreach my $group (@groups) {
+    my @group_tree = split(/[.]/, $group);
+    #print "LHHD: " . &Dumper(\@group_tree) . "\n";
+    my $child_group = pop @group_tree;
+    my $new_group_pws3_path = join(".", @group_tree);
+    my $pws3_parent_group = $new_group; # default to new parent group
+    if (defined($new_groups{$new_group_pws3_path})) {
+      $pws3_parent_group = $new_groups{$new_group_pws3_path};
+    }
+    #print "LHHD: need2make *$child_group* under *$new_group_pws3_path*\n";
+    #print "LHHD: creating $child_group under $pws3_parent_group\n";
+    $new_groups{$group}=$k->add_group({
+      title => $child_group,
+      group => $pws3_parent_group,
+     });
+  }
+
+  # The new group(s) are made, now insert the records...
+  $k->unlock();
+  foreach my $record (@records) {
+    my $pws3_group = $record->group();
+    my $new_entry = {
+      'group'    => $new_groups{$pws3_group},
+      'title'    => $record->title(),
+      'username' => $record->user(),
+      'password' => $record->passwd(),
+      'comment'  => $record->notes(),
+      'url'      => $record->url(),
+      'created'  => strftime("%Y-%m-%d %H:%M:%S",localtime($record->ctime())),
+      'modified' => strftime("%Y-%m-%d %H:%M:%S",localtime($record->mtime())),
+      'accessed' => strftime("%Y-%m-%d %H:%M:%S",localtime($record->atime())),
+      'expires'  => strftime("%Y-%m-%d %H:%M:%S",localtime($record->pwexp())),
+    };
+    $k->add_entry($new_entry);
+    #print "LHHD: " . &Dumper($record) . "\n";
+  }
+  $k->lock();
+
+  # Refresh all paths and mark state as changed
+  refresh_state_all_paths();
+  $state->{kdb_has_changed}=1;
+  RequestSaveOnDBChange();
+}
+
+sub cli_import_keepass {
+  my $file = shift @_;
+  my $master_pass = shift @_;
+  my $key_file = shift @_;
+  my $grp_name = shift @_;
+  my $parent_group = shift @_;
+  our $state;
+
   my $iKDB = File::KeePass->new;
   if (! eval { $iKDB->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
@@ -4551,10 +4675,14 @@ sub get_readline_term($$) {
   my $rOPTIONAL_PM = shift @_;
   my $app_name = shift @_;
   my @rl_modules = ();
-  # The list of readlines that we support
-  push @rl_modules, 'Term::ReadLine::Gnu';
-  push @rl_modules, 'Term::ReadLine::Perl';
-  push @rl_modules, 'Term::ReadLine::Perl5';
+  if (defined($FORCED_READLINE) && length($FORCED_READLINE)) {
+    push @rl_modules, $FORCED_READLINE;
+  } else {
+    # The full list of readlines that we support, in order of preference
+    push @rl_modules, 'Term::ReadLine::Gnu';
+    push @rl_modules, 'Term::ReadLine::Perl';
+    push @rl_modules, 'Term::ReadLine::Perl5';
+  }
   my $rl_term = undef;
   my $hold_TERM=undef;
   MODULE: foreach my $module (@rl_modules) {
@@ -4604,8 +4732,9 @@ sub get_readline_term($$) {
     # still comes from Term::ReadLine::Gnu at line 250 with perl
     # v5.14.2 and Term::ReadLine::Gnu 1.20-2. That is suppressed
     # in a different way, just above in this same function.
-    no warnings 'once';
+    no warnings qw(deprecated);
     $rl_term->ornaments(0);
+    use warnings qw(all);
   }
 
   # I'm not sure that these are only needed on Windows, but I know they
@@ -4646,25 +4775,25 @@ sub get_readline_term($$) {
 # Use simple magic recipes to identify relevant file types
 sub magic_file_type($) {
   my $filename = shift @_;
-  my $fh=new FileHandle;
   my $header='';
-  if (open($fh, '<', $filename)) {
+  my $fh = FileHandle->new($filename, "r");
+  if (defined $fh) {
     my $n = read $fh, $header, 4;
     close $fh;
   }
   # KeePass
   # Recipe from https://github.com/glensc/file/blob/master/magic/Magdir/keepass
-  # 0       lelong            0x9AA2D903      Keepass password database
-  # >4       lelong            0xB54BFB65      1.x KDB
-  # >>48       lelong            >0              \b, %d groups
-  # >>52       lelong            >0              \b, %d entries
-  # >>8       lelong&0x0f    1              \b, SHA-256
-  # >>8       lelong&0x0f    2              \b, AES
-  # >>8       lelong&0x0f    4              \b, RC4
-  # >>8       lelong&0x0f    8              \b, Twofish
-  # >>120       lelong            >0          \b, %d key transformation rounds
-  # >4       lelong            0xB54BFB67      2.x KDBX
-  if ($header =~ m/^\x03\xd9\xa2\x9a/) {
+  #0       lelong	0x9AA2D903	Keepass password database
+  #>4      lelong	0xB54BFB65	1.x KDB
+  #>>48    lelong	>0		\b, %d groups
+  #>>52    lelong	>0		\b, %d entries
+  #>>8     lelong&0x0f	1		\b, SHA-256
+  #>>8     lelong&0x0f	2		\b, AES
+  #>>8     lelong&0x0f	4		\b, RC4
+  #>>8     lelong&0x0f	8		\b, Twofish
+  #>>120   lelong	>0		\b, %d key transformation rounds
+  #>4      lelong	0xB54BFB67	2.x KDBX
+  if ($header =~ m/^(\x9a\xa2\xd9\x03|\x03\xd9\xa2\x9a)/) { # See SF bug #19
     return 'keepass';
   }
   # Password Safe v3
@@ -4675,9 +4804,7 @@ sub magic_file_type($) {
   return undef;
 }
 
-########################################################################
 # Unix-style, "touch" a file
-########################################################################
 sub touch_file {
   my $filename = shift @_;
   if (! -f $filename) {
@@ -4691,6 +4818,12 @@ sub touch_file {
   my $retval=utime $now, $now, $filename;
   $SIG{'PIPE'} = $sig_pipe_store;
 return($retval);
+}
+
+# Convenience function to uniq an array
+sub uniq {
+  my %seen;
+  return grep { !$seen{$_}++ } @_;
 }
 
 ########################################################################
@@ -4729,7 +4862,7 @@ C<Term::ShellUI>   - libterm-shellui-perl on Ubuntu 12.10
 
 It is recommended that you install C<Term::ReadLine::Gnu> which will
 provide more fluid signal handling on Unix-like systems, making kpcli
-robust to suspend, resume, and interupt - SIGSTP, SIGCONT and SIGINT.
+robust to suspend, resume, and interrupt - SIGSTP, SIGCONT and SIGINT.
 That module is in the libterm-readline-gnu-perl package on Ubuntu.
 
 You can optionally install C<Clipboard> and C<Tiny::Capture> to use the
@@ -4738,6 +4871,11 @@ libcapture-tiny-perl on Ubuntu 10.04.
 
 You can optionally install C<Data::Password> to use the pwck feature
 (Password Quality Check); libdata-password-perl on Ubuntu 10.04.
+
+You can optionally install C<Crypt::PWSafe3> in order to import
+Password Safe v3 files (http://passwordsafe.sf.net). The dependency
+list of this module is hefty and it is not packaged in many distros,
+but cpanminus installs it nicely on Linux Mint (https://cpanmin.us/).
 
 On MS Windows, you can optionally install C<Win32::Console::ANSI> to get
 ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
@@ -4755,6 +4893,17 @@ also the author's intent to maintain compatibility with v1 files, and so
 anyone sending patches, for consideration for inclusion in future kpcli
 versions, is asked to validate them with both v1 and v2 files.
 
+=head2 Some versions of Term::ReadLine::Perl5 are incompatible
+
+Some versions of C<Term::ReadLine::Perl5> are incompatible with the
+C<Term::ShellUI> module, which is core to kpcli. There is information
+about this in kpcli SF bug #18 (http://sourceforge.net/p/kpcli/bugs/18/).
+The C<Term::ReadLine::Perl5> author submitted a C<Term::ShellUI> patch
+to resolve the issue (https://rt.cpan.org/Ticket/Display.html?id=105375).
+As of this writing that patch is not integrated and so I am making a note
+of it here for users that it may bite. Those users are most often on
+MacOS X or Windows. Linux users most often use C<Term::ReadLine::Gnu>.
+
 =head2 No history tracking for KeePass 2 (*.kdbx) files
 
 Recording entries' history in KeePass 2 files is not implemented. History
@@ -4762,7 +4911,7 @@ that exists in a file is not destroyed, but results of entry changes made
 in kpcli are not recorded into their history. Prior-to-change copies are
 stored into the "Recycle Bin." Note that File::KeePass does not encrypt
 passwords of history entries in RAM, like it does for current entries.
-This is a small security risk that can, in theory, allow priviledged users
+This is a small security risk that can, in theory, allow privileged users
 to steal your passwords from RAM, from entry history.
 
 =head2 File::KeePass bug prior to version 2.03
@@ -4972,6 +5121,11 @@ this program would not have been practical for me to author.
                      ability to manage _all_ listed entries by number.
                     Added shell expansion support to cli_mv.
                     Added [y/N] option to list entries after a find.
+ 2015-Jun-19 v3.0 - Added Password Safe v3 file importing; requires
+                     optional Crypt::PWSafe3 from CPAN.
+                    Added $FORCED_READLINE global variable.
+                    Attachments sanity check; SourceForge bug #17.
+                    Endianness fix in magic_file_type(); SF bug #19.
 
 =head1 TODO ITEMS
 
@@ -4994,17 +5148,13 @@ this program would not have been practical for me to author.
   Consider adding searches for created, modified, and accessed times
   older than a user supplied time.
 
-  Consider adding import support for Password Safe v3 files using
-  http://search.cpan.org/~tlinden/Crypt-PWSafe3/. May have already
-  done this if the unpackaged dependencies list was not so long.
-
 =head1 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
 =pod OSNAMES
 
 Unix-like
  - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
- - As of version 2.5, development is done on Linux Mint 16.
+ - As of version 3.0, development is done on Linux Mint 17.
  - Known to work on many other Linux and *BSD distributions, and
    kpcli is packaged with many distributions now-a-days.
 
