@@ -1,4 +1,4 @@
-KPCLI-3.1(1)          User Contributed Perl Documentation         KPCLI-3.1(1)
+KPCLI-3.2(1)          User Contributed Perl Documentation         KPCLI-3.2(1)
 
 
 
@@ -314,12 +314,14 @@ CHANGELOG
                             - rt.cpan.org tik# 113391; https://goo.gl/v65HKE
                            Applied SF patch #8 from Maciej Grela.
                            Optional better RNG; SF bug #30 from Aaron Toponce.
+        2017-Dec-22 v3.2 - Added xpx command per the request in SF ticket #32.
+                           Added autosave functionality (shadow copies).
+                           Fixed a bug in new_edit_multiline_input() that was
+                            preventing blank lines between paragraphs.
+                           Fixed a typo in the --help info for --pwfile.
+                           Fixed a small bug in subroutine destroy_found().
 
 TODO ITEMS
-         Consider adding /shadow_copies/<entries> feature, where kpcli
-         will write "shadow copies" of the database, one for each entry,
-         using the path/password in the url/password fields.
-
          Consider broadening shell_expansion support beyond just mv and ls.
 
          Consider adding a tags command for use with v2 files.
@@ -343,10 +345,10 @@ OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
        Microsoft Windows
         - As of v2.4, Microsoft Windows is also supported.
-        - Tested and compiled on Strawberry Perl 5.16.2 on Windows 7.
+        - Tested and compiled on Strawberry Perl 5.16.2 on Windows 10.
 
        "UNIX/System_administration", "Win32/Utilities"
 
 
 
-perl v5.18.2                      2016-07-30                      KPCLI-3.1(1)
+perl v5.18.2                      2017-12-22                      KPCLI-3.2(1)
