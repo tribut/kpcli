@@ -111,7 +111,7 @@ my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.2";
+my $VERSION = "3.3";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts=MyGetOpts();   # Will only return with options we think we can use
@@ -1008,7 +1008,7 @@ sub cli_pwck {
       if (! length(humanize_path($path))) {
         my $ent_id = $problems{$state->{all_ent_paths}->{$path}};
         my $ent = $state->{kdb}->find_entry({id => $ent_id});
-        warn "LHHD: ".&Dumper($ent)."\n";
+        #warn "LHHD: ".&Dumper($ent)."\n";
       }
     }
   }
@@ -1503,6 +1503,7 @@ sub cli_find($) {
   $k->unlock;
   my @matches=();
   my %duplicates=();
+  my %duplicate_titles=();
   FINDS: foreach my $ent (@e) {
     my %new_ent = %{clone($ent)}; # Clone the entity
     $new_ent{id} = int(rand(1000000000000000)); # A random new id
@@ -1511,10 +1512,19 @@ sub cli_find($) {
     # safe because we are adding it to entries in the /_found group which
     # will not be saved to a file.
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
+    my @path_pieces = split(/\0/, $nulled_path);
+    if (scalar(@path_pieces) > 1 && $path_pieces[$#path_pieces-1] =~ m/^old$/i) {
+      $new_ent{'__in_old_dir'} = 1; # Mark as being in an OLD directory (only safe in /_found).
+    }
     $new_ent{full_path} = '/' . humanize_path($nulled_path);
     $new_ent{path} = dirname($new_ent{full_path}) . '/';
     if (defined($duplicates{$new_ent{full_path}})) { next FINDS; }
     $duplicates{$new_ent{full_path}} = 1;
+    # Do duplicate title detection and modify any duplicates by adding a count to te title
+    $duplicate_titles{$new_ent{title}} = int($duplicate_titles{$new_ent{title}}) + 1;
+    if ($duplicate_titles{$new_ent{title}} > 1) {
+      $new_ent{title} = $new_ent{title} . " (" . $duplicate_titles{$new_ent{title}} . ")";
+    }
     $k->add_entry(\%new_ent);
     push(@matches, \%new_ent);
     # If the user hit ^C (SIGINT) then we need to stop
@@ -1655,6 +1665,14 @@ sub cli_save($) {
   $k->unlock;
   my $master_pass=
 	composite_master_pass($state->{get_master_passwd}(),$state->{key_file});
+
+  # We hold a read file handle open for no reason other than
+  # to show up in lsof. Close it prior to saving the database,
+  # else Windows has problems (reported in SF patch #11).
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
+
   # Note: adding the 3rd parameter (header) here was in response to a bug reported
   # on 03/27/2016 via email to me from a person named marco. There is a bug in
   # File::KeePass that will make this save_db() call revert a V2 database to v1 if
@@ -1678,11 +1696,7 @@ sub cli_save($) {
   $k->lock;
   my $file = $state->{kdb_file};
 
-  # We hold a read file handle open for no reason other than
-  # to show up in lsof.
-  if (defined($state->{kdb_file_handle})) {
-    close $state->{kdb_file_handle};
-  }
+  # Reopen file handle to show up in lsof...
   $state->{kdb_file_handle} = new FileHandle;
   open($state->{kdb_file_handle}, '<', $file);
 
@@ -3194,10 +3208,6 @@ sub cli_export($$) {
   my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
   if (! defined($master_pass)) { return undef; }
-  if (length($master_pass) == 0) {
-    print "For your safety, empty passwords are not allowed...\n";
-    return;
-  }
 
   # Generate the key file if so instructed
   if (defined($key_file) && $make_keyfile) {
@@ -3214,6 +3224,13 @@ sub cli_export($$) {
       print "ERROR: generated key file is the wrong size: $key_file\n";
       return -1;
     }
+  }
+
+  # Only allow an empty password if a reasonable $key_file exists
+  if (length($master_pass) == 0 && ( ! -e $key_file || -s $key_file < 128 )) {
+    print	"For your safety, empty passwords are not allowed\n" .
+		"with key files less than 128 bytes in length...\n";
+    return;
   }
 
   # Build the new kdb in RAM
@@ -3333,10 +3350,6 @@ sub cli_saveas($) {
   my $master_pass=GetMasterPasswdDoubleEntryVerify();
   if (recent_sigint()) { return undef; } # Bail on SIGINT
   if (! defined($master_pass)) { return undef; }
-  if (length($master_pass) == 0) {
-    print "For your safety, empty passwords are not allowed...\n";
-    return;
-  }
 
   # Generate the key file if so instructed
   if (defined($key_file) && $make_keyfile) {
@@ -3353,6 +3366,13 @@ sub cli_saveas($) {
       print "ERROR: generated key file is the wrong size: $key_file\n";
       return -1;
     }
+  }
+
+  # Only allow an empty password if a reasonable $key_file exists
+  if (length($master_pass) == 0 && ( ! -e $key_file || -s $key_file < 128 )) {
+    print	"For your safety, empty passwords are not allowed\n" .
+		"with key files less than 128 bytes in length...\n";
+    return;
   }
 
   destroy_found();
@@ -3748,11 +3768,16 @@ sub get_human_entry_list {
   my $i=0;
   my $d_len = length(scalar(@{$rEntries}) - 1 + $start_num);
   foreach my $ent (@{$rEntries}) {
+    my $path = $state->{all_ent_paths_rev}->{$ent->{id}};
     my $url=$ent->{url};
     $url=~s/^https?:\/\///i;
     $url=~s/\/+$//;
+    my $title = $ent->{title};
+    if (defined($ent->{'__in_old_dir'}) && $ent->{'__in_old_dir'}) {
+      $title = "*OLD: " . $title;
+    }
     push (@list, sprintf("%".$d_len."d. %-40.40s %30.30s",
-				$i + $start_num, $ent->{title}, $url));
+				$i + $start_num, $title, $url));
     $i++;
   }
   return \@list;
@@ -3976,6 +4001,7 @@ sub do_attach_file {
   }
   # If we get this far we're OK to attach it
   open(my $fh,'<',$path_to_file) || return "Couldn't open file $path_to_file";
+  binmode($fh, ":raw"); # Read raw binary (reported in SF patch #11).
   read($fh, my $buffer, $size);
   close $fh;
   if (length($buffer) != $size) {
@@ -5542,6 +5568,15 @@ this program would not have been practical for me to author.
                      preventing blank lines between paragraphs.
                     Fixed a typo in the --help info for --pwfile.
                     Fixed a small bug in subroutine destroy_found().
+ 2019-Aug-16 v3.3 - Allow open and save with key-only authentication,
+                     as requested in SF bug #35.
+                  - Prevent "multiple entries titled" warning in the
+                     /_found/ area, as reports in SF bug #36.
+                  - Fix two bugs affecting Windows, as reported in
+                     SourceForge patch #11.
+                  - Mark /_found entries as "*OLD" when listed, if
+                     they reside in a group named old. Addresses an
+                     issue where searches turn up "old" accounts.
 
 =head1 TODO ITEMS
 

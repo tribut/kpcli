@@ -1,4 +1,4 @@
-KPCLI-3.2(1)          User Contributed Perl Documentation         KPCLI-3.2(1)
+KPCLI-3.3(1)          User Contributed Perl Documentation         KPCLI-3.3(1)
 
 
 
@@ -320,6 +320,15 @@ CHANGELOG
                             preventing blank lines between paragraphs.
                            Fixed a typo in the --help info for --pwfile.
                            Fixed a small bug in subroutine destroy_found().
+        2019-Aug-16 v3.3 - Allow open and save with key-only authentication,
+                            as requested in SF bug #35.
+                         - Prevent "multiple entries titled" warning in the
+                            /_found/ area, as reports in SF bug #36.
+                         - Fix two bugs affecting Windows, as reported in
+                            SourceForge patch #11.
+                         - Mark /_found entries as "*OLD" when listed, if
+                            they reside in a group named old. Addresses an
+                            issue where searches turn up "old" accounts.
 
 TODO ITEMS
          Consider broadening shell_expansion support beyond just mv and ls.
@@ -351,4 +360,4 @@ OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
 
 
-perl v5.18.2                      2017-12-22                      KPCLI-3.2(1)
+perl v5.18.2                      2019-08-16                      KPCLI-3.3(1)
