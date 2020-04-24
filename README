@@ -1,4 +1,4 @@
-KPCLI-3.3(1)          User Contributed Perl Documentation         KPCLI-3.3(1)
+KPCLI-3.4(1)          User Contributed Perl Documentation         KPCLI-3.4(1)
 
 
 
@@ -39,8 +39,8 @@ PREREQUISITES
        preferred on platforms without GNU readline (MacOS, Windows, etc.)
 
        You can optionally install "Clipboard" and "Tiny::Capture" to use the
-       clipboard features; http://search.cpan.org/~king/Clipboard/ and
-       libcapture-tiny-perl on Ubuntu 10.04.
+       clipboard features; https://metacpan.org/pod/Clipboard and libcapture-
+       tiny-perl on Ubuntu 10.04.
 
        You can optionally install "Sub::Install" to use the --timeout feature.
 
@@ -64,6 +64,10 @@ PREREQUISITES
 
        You can optionally install "Math::Random::ISAAC" in order to use a more
        secure rand() function. Package libmath-random-isaac-perl on Debian.
+
+       You can optionally install "Authen::OATH" and "Convert::Base32" to use
+       the TOTP one time password functionality (RFC 6238).  Those are
+       packages libauthen-oath-perl and libconvert-base32-perl on Debian.
 
        On MS Windows, you can optionally install "Win32::Console::ANSI" to get
        ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
@@ -329,8 +333,39 @@ CHANGELOG
                          - Mark /_found entries as "*OLD" when listed, if
                             they reside in a group named old. Addresses an
                             issue where searches turn up "old" accounts.
+        2020-Apr-25 v3.4 - Marking of "*OLD" /_found entries now includes
+                            those having any "old" group in the entire path.
+                         - Added get_macos_version() and now report more
+                            details for macOS in the vers command.
+                         - Test for a new enough version of Clipboard if on
+                            macOS 10.15.0 or newer. See SF bug #41.
+                         - Added some vers reporting of a few OS-specific
+                            modules (around clipboard functionality).
+                         - Added the "ver -vv" and "vers -v" options, for
+                            addional verbosity of version reporting.
+                         - Added --pwsplchars option, as requested in
+                            SourceForge feature request #19.
+                         - Fixed a few new "perl -cw" warnings.
+                         - Added "use diagnostics" and cleaned up some items
+                            that it pointed out.
+                         - Added Google Authenticator style 2FA-TOTP support,
+                            and with it the otp and xo commands.
+                         - Added --xpxsecs option, as requested in
+                            SourceForge feature request #20.
 
 TODO ITEMS
+         Consider adding support for TOTP with different digest algorithms
+         than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
+         the TOTP time to be something other than 30 seconds and the length
+         of the OTP to be something other than six digits. None of those
+         options are broadly used today, but when writing the TOTP code, I
+         stumbled across a few. I did not implement it now primarily because
+         Authen::OATH isn't very condusive to using other digest algorithms.
+         For future reference, I'd likely construct the strings like this:
+           2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
+         This code may prove useful if I decide to not use Authen::OATH:
+         https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
+
          Consider broadening shell_expansion support beyond just mv and ls.
 
          Consider adding a tags command for use with v2 files.
@@ -351,6 +386,7 @@ OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
         - As of version 3.0, development is done on Linux Mint 17.
         - Known to work on many other Linux and *BSD distributions, and
           kpcli is packaged with many distributions now-a-days.
+        - Known to work on macOS and is packaged in Homebrew (brew.sh).
 
        Microsoft Windows
         - As of v2.4, Microsoft Windows is also supported.
@@ -360,4 +396,4 @@ OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
 
 
 
-perl v5.18.2                      2019-08-16                      KPCLI-3.3(1)
+perl v5.18.2                      2020-04-25                      KPCLI-3.4(1)

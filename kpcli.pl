@@ -16,8 +16,10 @@
 ###########################################################################
 
 # The required perl modules
+use 5.9.4;   # Version when Module::Loaded was added
 use strict;                                   # core
 use version;                                  # core
+#use diagnostics;                              # core
 use File::Spec;                               # core
 use FileHandle;                               # core
 use Getopt::Long;                             # core
@@ -34,6 +36,7 @@ use Time::Local qw(timegm);                   # core
 use Clone qw(clone);                          # core
 use Time::Piece;                              # core
 use Time::Seconds;                            # core
+use Module::Loaded qw(is_loaded);             # core
 use POSIX;                   # core, required for unsafe signal handling
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
@@ -94,6 +97,9 @@ sub rand {
   }
   return CORE::rand($ceiling);
 }
+if (runtime_load_module(\%OPTIONAL_PM,'Authen::OATH',undef)) {
+  runtime_load_module(\%OPTIONAL_PM,'Convert::Base32',[qw(decode_base32)]);
+}
 
 $|=1; # flush immediately after writes or prints to STDOUT
 
@@ -111,10 +117,10 @@ my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.3";
+my $VERSION = "3.4";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
-my $opts=MyGetOpts();   # Will only return with options we think we can use
+my $opts = MyGetOpts(); # Will only return with options we think we can use
 
 my $doc_passwd_gen =
 	"For password generation, the \"g\" method produces a\n" .
@@ -163,8 +169,8 @@ my $term = new Term::ShellUI(
          },
          "vers" => {
              desc => "Same as \"ver -v\"",
-             minargs => 0, maxargs => 0,
-             method => sub { cli_version(shift, { args => ['-v'] }); },
+             minargs => 0, maxargs => 1,
+             method => \&cli_versions,
              exclude_from_completion=>1, exclude_from_history => 1,
              timeout_exempt => 1,
          },
@@ -342,6 +348,12 @@ my $term = new Term::ShellUI(
              args => \&complete_groups_and_entries,
              method => sub { cli_xN('xp', @_); }
          },
+         "xo" => {
+             desc => "Copy one-time password to clipboard: xo <entry path|number>",
+             minargs => 1, maxargs => 1,
+             args => \&complete_groups_and_entries,
+             method => sub { cli_xN('xo', @_); }
+         },
          "xpx" => {
              desc => "Copy password to clipboard, with auto-clear: xpx <entry path|number>",
              minargs => 1, maxargs => 1,
@@ -390,6 +402,25 @@ my $term = new Term::ShellUI(
              minargs => 1, maxargs => 3,
              args => \&complete_groups_and_entries,
              method => \&cli_show,
+         },
+         "otp" => {
+             desc => "Show one-time password: otp <entry path|number>",
+             doc => "\n" .
+		"The otp command calculates and shows a one-time\n" .
+		"password for the entry. Only Google Authenticator style\n" .
+		"TOTPs are currently supported (TOTP per RFC 6238).\n" .
+		"https://en.wikipedia.org/wiki/Google_Authenticator\n" .
+		"\n" .
+		"To configure an entry for this feature, place a line in\n" .
+		"in the entry's comments, as follows:\n" .
+		"\n" .
+		"2FA-TOTP: TheBase32SecretKeyProvided\n" .
+		"\n" .
+		"The show command also provides OTPs for those entries.\n" .
+		"",
+             minargs => 1, maxargs => 3,
+             args => \&complete_groups_and_entries,
+             method => \&cli_otp,
          },
          "edit" => {
              desc => "Edit an entry: edit <path to entry|entry number>",
@@ -553,7 +584,7 @@ if (defined($opts->{timeout}) && int($opts->{timeout}) > 0) {
 
 if ( defined($opts->{command}) ) {
     $term->process_a_cmd($opts->{command});
-    cli_quit($term,undef); # Needed else we leave a foo.lock file behind
+    &cli_quit($term,undef); # Needed else we leave a foo.lock file behind
 } else {
     $term->run();
 }
@@ -613,7 +644,7 @@ sub open_kdb {
     die "Couldn't load the file $file: $@";
   }
 
-  if ($state->{placed_lock_file}) {
+  if (defined($state->{placed_lock_file})) {
     touch_file($state->{placed_lock_file});
   }
 
@@ -727,7 +758,8 @@ sub build_all_entry_paths {
 # Returns the current path the user is sitting in.
 sub get_pwd {
   my $pwd='';
-  if (defined($state->{all_grp_paths_rev}->{$state->{path}->{id}})) {
+  if (defined($state->{path}->{id}) &&
+	defined($state->{all_grp_paths_rev}->{$state->{path}->{id}})) {
     $pwd=$state->{all_grp_paths_rev}->{$state->{path}->{id}};
   }
   $pwd =~ s%/%\\/%g;
@@ -894,10 +926,11 @@ sub cli_pwck {
     # Try to load it. If we succeed, set $pwckMethod and bail out
     if (runtime_load_module(\%OPTIONAL_PM,$pwckmod,undef)) {
       if ($pwckmod eq 'Data::Password::passwdqc') {
+        no warnings 'once'; # These are intentionally only used once
         $Data::Password::passwdqc::max=999; # Max password length allowed
         $Data::Password::passwdqc::min=[INT_MAX, 20, 11, 8, 7]; # man pwqcheck
       } elsif ($pwckmod eq 'Data::Password') {
-        #no warnings 'once';
+        no warnings 'once'; # These are intentionally only used once
         $Data::Password::MINLEN = 8;
         $Data::Password::MAXLEN = 0;
       }
@@ -1170,7 +1203,11 @@ sub normalize_path_string($) {
   if ($path_string =~ m%^/%) { # Absolute path
     $path_str=join("\0",@path);
   } else { # Relative path
-    my $pwd=$state->{all_grp_paths_rev}->{$state->{path}->{id}};
+    my $pwd='';
+    if (defined($state->{path}->{id}) && 
+	defined($state->{all_grp_paths_rev}->{$state->{path}->{id}})) {
+      $pwd = $state->{all_grp_paths_rev}->{$state->{path}->{id}};
+    }
     my @nwd=split("\0", $pwd);
     push @nwd, @path;
     $path_str=join("\0", @nwd);
@@ -1513,7 +1550,7 @@ sub cli_find($) {
     # will not be saved to a file.
     my $nulled_path=$state->{all_ent_paths_rev}->{$ent->{id}};
     my @path_pieces = split(/\0/, $nulled_path);
-    if (scalar(@path_pieces) > 1 && $path_pieces[$#path_pieces-1] =~ m/^old$/i) {
+    if (scalar(@path_pieces) > 1 && scalar(grep(/^old$/i, @path_pieces))) {
       $new_ent{'__in_old_dir'} = 1; # Mark as being in an OLD directory (only safe in /_found).
     }
     $new_ent{full_path} = '/' . humanize_path($nulled_path);
@@ -1755,14 +1792,34 @@ sub cli_xN($$) {
   # If Clipboard is not avaiable we can't do this for the user
   if  (! $state->{OPTIONAL_PM}->{'Clipboard'}->{loaded}) {
     print "Error: $xNcmd requires the Clipboard and Capture::Tiny modules:\n" .
-	" - http://search.cpan.org/~king/Clipboard/\n" .
-	" - http://search.cpan.org/~dagolden/Capture-Tiny/\n" .
+	" - https://metacpan.org/pod/Clipboard\n" .
+	" - https://metacpan.org/pod/Capture::Tiny\n" .
 	"";
     if (defined($state->{OPTIONAL_PM}->{'Clipboard'}->{error})) {
       print "\nThere was an error loading the Clipboard module, as follows:\n" .
 		$state->{OPTIONAL_PM}->{'Clipboard'}->{error} . "\n";
     }
     return;
+  }
+
+  # Check the version of Clipboard if we're on macOS Catalina or newer.
+  # See https://sourceforge.net/p/kpcli/bugs/41/
+  if (lc($OSNAME) eq 'darwin') {
+    my $osver = get_macos_version();
+    if (defined($osver) && defined($osver->{'ProductVersion'})) {
+      my $macOSverMax = '10.15.0'; # macOS Catalina began at 10.15.0
+      my $ClipVerMin = '0.21';     # Catalina first supported in 0.21
+      my $vernum = $osver->{'ProductVersion'};
+      if (version->parse($vernum) >= version->parse($macOSverMax)) {
+        no strict 'refs';
+        my $vstr="Clipboard::VERSION";
+        my $Clipboard_ver = ${$vstr};
+        if (version->parse($Clipboard_ver) < version->parse($ClipVerMin)) {
+          print color('yellow')."WARNING: For macOS $macOSverMax and higher, ".
+                "Clipboard $ClipVerMin or newer is needed\n" .color('clear');
+        }
+      }
+    }
   }
 
   # If we're clearing the clipboard, just do that and return immediately.
@@ -1780,6 +1837,18 @@ sub cli_xN($$) {
     return -1;
   }
 
+  # 2FA-TOTP generation
+  my $otp = undef;
+  if ($xNcmd eq 'xo') {
+    my ($key2FA,$digest) = get_otp_data_from_comment($ent->{comment});
+    if (defined($key2FA) && defined($digest)) {
+      $otp = get_totp($key2FA,$digest);
+    } else {
+      print "No OTP for this entry.\n";
+      return -1;
+    }
+  }
+
   # Switch over the xN commands and place the data into $to_copy
   my $to_copy = '';
   SWITCH: {
@@ -1788,6 +1857,7 @@ sub cli_xN($$) {
     $xNcmd =~ m/^xpx?$/ && do {
 			$to_copy = $state->{kdb}->locked_entry_password($ent);
 			last SWITCH; };
+    $xNcmd eq 'xo' && do { $to_copy = $otp; last SWITCH; };
     warn "Error: cli_xN() does not know how to handle the $xNcmd command.";
     $to_copy = undef;
   }
@@ -1798,6 +1868,7 @@ sub cli_xN($$) {
 	'xw' => 'url',
 	'xp' => 'password',
 	'xpx' => 'password',
+	'xo' => 'OTP',
 	};
   if (defined($to_copy)) {
     Clipboard->copy($to_copy);
@@ -1805,8 +1876,9 @@ sub cli_xN($$) {
   }
 
   # The user has asked us to auto-clear the clipboard
+  my $xpxsecs = $opts->{xpxsecs} - 1;
   if ($xNcmd eq 'xpx') {
-    for my $n (reverse (0..9)) {
+    for my $n (reverse (0..$xpxsecs)) {
       for my $i (reverse (0..9)) {
         if (($i > 0 || $n == 0) && !($i % 3)) {
           print "\rClipboard will be cleared in $n.$i seconds...";
@@ -2189,6 +2261,37 @@ sub cli_clone($$) {
   }
 }
 
+sub cli_otp($$) {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
+  my ($otp_supported, $reason) = have_otp_support();
+  if (! $otp_supported) {
+    print color('bold yellow') . $reason . color('clear') . "\n";
+    return -1;
+  }
+
+  my $target = $params->{args}->[0];
+  my $ent=find_target_entity_by_number_or_path($target);
+  if (! defined($ent)) {
+    return -1;
+  }
+
+  # 2FA-TOTP generation
+  my ($key2FA,$digest) = get_otp_data_from_comment($ent->{comment});
+  if (defined($key2FA) && defined($digest)) {
+    my $otp = get_totp($key2FA,$digest);
+    print "$otp\n";
+    return 0;
+  }
+
+  print "No OTP for this entry.\n";
+  return -1;
+}
+
 sub cli_show($$) {
   my $self = shift @_;
   my $params = shift @_;
@@ -2214,20 +2317,34 @@ sub cli_show($$) {
     return -1;
   }
 
-  print "\n";
-  if (defined($ent->{path})) {
-    print show_format("Path",$ent->{path}) . "\n";
-  }
   # Unless -f is specified, we "hide" the password as red-on-red.
   my $password = $state->{kdb}->locked_entry_password($ent);
   if (! defined($opts{f})) {
     $password = colored(['red on_red'], $password);
   }
+  # 2FA-TOTP generation
+  my $otp = undef;
+  if ($state->{OPTIONAL_PM}->{'Authen::OATH'}->{loaded}) {
+    my ($key2FA,$digest) = get_otp_data_from_comment($ent->{comment});
+    if (defined($key2FA) && defined($digest)) {
+      my ($otp_supported, $reason) = have_otp_support();
+      if (! $otp_supported) {
+        print color('bold yellow') . $reason . color('clear') . "\n";
+      } else {
+        $otp = get_totp($key2FA,$digest);
+      }
+    }
+  }
   # Print the entry for the user
+  print "\n";
+  if (defined($ent->{path})) {
+    print show_format("Path",$ent->{path}) . "\n";
+  }
   print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
 	show_format("Pass",$password) . "\n" .
+	(defined($otp) ? show_format("OTP",$otp) . "\n" : '') .
 	show_format("URL",$ent->{url}) . "\n" .
 	show_format("Notes",$ent->{comment}) . "\n" .
 	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '');
@@ -2780,7 +2897,7 @@ sub get_entry_fields {
 # Returns true if $state->{signals}->{INT} indicates a SIGINT more
 # recently than the $timeframe given, which defaults to 0.25 secs.
 sub recent_sigint() {
-  my $timeframe = shift @_;
+  my $timeframe = shift @_ || 0.25;
   if ($timeframe !~ m/^([0-9]*\.[0-9]+|[0-9]+)$/) { $timeframe = 0.25; }
   our $state;
   if (defined($state->{signals}->{INT}) &&
@@ -3639,7 +3756,9 @@ sub new_kdb {
   $state->{'kdb'}->add_group({ title => 'eMail' });
   $state->{'kdb'}->add_group({ title => 'Internet' });
   refresh_state_all_paths();
-  if (-f $state->{placed_lock_file}) { unlink($state->{placed_lock_file}); }
+  if (defined($state->{placed_lock_file}) && -f $state->{placed_lock_file}) {
+    unlink($state->{placed_lock_file});
+  }
   delete($state->{placed_lock_file});
   delete($state->{kdb_file});
   delete($state->{key_file});
@@ -4094,7 +4213,9 @@ sub cli_quit($$) {
     }
   }
 
-  if (-f $state->{placed_lock_file}) { unlink($state->{placed_lock_file}); }
+  if (defined($state->{placed_lock_file}) && -f $state->{placed_lock_file}) {
+    unlink($state->{placed_lock_file});
+  }
   delete($state->{placed_lock_file});
   $self->exit_requested(1);
   return 0; # It's OK to quit
@@ -4120,6 +4241,20 @@ sub cli_autosave {
   if ($no_print) { return $t; } else { print $t; }
 }
 
+sub cli_versions($$) {
+  my $self = shift @_;
+  my $params = shift @_;
+  my %opts=();
+  {
+    local @ARGV = @{$params->{args}};
+    my $result = &GetOptions(\%opts, 'v');
+  }
+  if ($opts{'v'}) {
+    return cli_version(shift, { args => ['-vv'] });
+  } else {
+    return cli_version(shift, { args => ['-v'] });
+  }
+}
 sub cli_version($$) {
   my $self = shift @_;
   my $params = shift @_;
@@ -4133,42 +4268,41 @@ sub cli_version($$) {
   my %opts=();
   {
     local @ARGV = @{$params->{args}};
-    my $result = &GetOptions(\%opts, 'v');
+    my $result = &GetOptions(\%opts, 'v', 'vv');
   }
 
-  if ($opts{'v'}) {
-    print "VERSIONS\n";
-    print " * kpcli: $VERSION\n";
+  # Without a -v or -vv, simply print the kpcli version
+  if (! ($opts{'v'} || $opts{'vv'})) {
+    print "$VERSION\n";
+    return;
+  }
+
+  # Items for -v
+  my @modules_reported_on = (); # So we don't double-report in -vv
+  if ($opts{'v'} || $opts{'vv'}) {
+    print "kpcli: $VERSION\n";
+    # Perl version
     my $pv = $PERL_VERSION;
     if (! length($pv)) {
       $pv = $]; # For perl versions prior to 5.6.0
     }
-    print " * Perl: $pv\n";
-    my @modules = qw(File::KeePass Term::ShellUI Term::ReadKey Term::ReadLine);
-    my @missing_modules = ();
-    foreach my $module (sort keys %OPTIONAL_PM) {
-      if ($OPTIONAL_PM{$module}->{loaded}) {
-        push @modules, $module;
-      } else {
-        push @missing_modules, $module;
-      }
-    }
-    foreach my $module (@modules) {
-      no strict 'refs';
-      my $vstr=$module . "::VERSION";
-      print " * $module: " . ${$vstr} . "\n";
-    }
-    foreach my $module (@missing_modules) {
-      print " * $module: not installed (optional)\n";
-    }
-    print "\n";
-    print "ReadLine being used: " . $term->{term}->ReadLine . "\n";
+    print "Perl: $pv\n";
     # Operating System
     my $OS=$OSNAME;
     if (lc($OSNAME) eq 'linux') {
       my $lsbr = load_lsb_release();
       if (defined($lsbr) && defined($lsbr->{'DISTRIB_DESCRIPTION'})) {
         $OS .= " (" . $lsbr->{'DISTRIB_DESCRIPTION'} . ")";
+      }
+    } elsif (lc($OSNAME) eq 'darwin') {
+      my $osver = get_macos_version();
+      if (defined($osver) && defined($osver->{'ProductName'}) && 
+					defined($osver->{'ProductVersion'})) {
+        my $prodname = $osver->{'ProductName'};
+        if ($osver->{'ProductName'} =~ m/mac os x|macos/i) {
+          $prodname = 'macOS'; # More modern nomenclature
+        }
+        $OS .= " ($prodname ".$osver->{'ProductVersion'}.")";
       }
     } elsif (lc($OSNAME) eq 'mswin') {
       if (! $OPTIONAL_PM{'Win32'}->{loaded}) {
@@ -4179,8 +4313,66 @@ sub cli_version($$) {
       }
     }
     print "Operating system: $OS\n";
-  } else {
-    print "$VERSION\n";
+    print "ReadLine being used: " . $term->{term}->ReadLine . "\n";
+    print "\n";
+
+    print "Pivotal Perl Modules for kpcli\n";
+    my @modules = qw(File::KeePass Term::ShellUI Term::ReadKey Term::ReadLine);
+    my @missing_modules = ();
+    foreach my $module (sort keys %OPTIONAL_PM) {
+      if ($OPTIONAL_PM{$module}->{loaded}) {
+        push @modules, $module;
+      } else {
+        push @missing_modules, $module;
+      }
+    }
+    # There are a few OS-specific modules that we'd also
+    # like to report on.
+    my %OSspecificModules = (
+	darwin => [ qw( Mac::Pasteboard )  ],
+	mswin  => [ qw( Win32::Clipboard Win32::Console::ANSI ) ],
+	);
+    if (defined($OSspecificModules{lc($OSNAME)})) {
+      foreach my $module (@{$OSspecificModules{lc($OSNAME)}}) {
+        if (is_loaded($module)) {
+          push @modules, $module;
+        } else {
+          push @missing_modules, $module;
+        }
+      }
+    }
+    foreach my $module (@modules) {
+      no strict 'refs';
+      my $vstr=$module . "::VERSION";
+      print " * $module: " . ${$vstr} . "\n";
+    }
+    foreach my $module (@missing_modules) {
+      print " * $module: not installed (optional)\n";
+    }
+
+    @modules_reported_on = (@modules, @missing_modules);
+  }
+
+  # Additional items for -vv
+  if ($opts{'vv'}) {
+    my @loaded_modules = grep(/\.pm$/, nsort(keys %INC));
+    my $sep = File::Spec->catfile('', '');
+    my @mod_names = ();
+    foreach my $mod_path (@loaded_modules) {
+      my $mod_name = $mod_path;
+      $mod_name =~ s/\.pm$//;
+      $mod_name =~ s/\Q$sep\E/::/g;
+      # Skip modules that we've already reported on
+      if (scalar(grep(/^\Q$mod_name\E$/, @modules_reported_on))) { next; }
+      push @mod_names, $mod_name;
+    }
+    print "\nAll Other Loaded Perl Modules\n";
+    foreach my $module (@mod_names) {
+      no strict 'refs';
+      my $vstr=$module . "::VERSION";
+      my $modver = ${$vstr} || 'unknown';
+      print " * $module: $modver\n";
+    }
   }
 }
 
@@ -4194,6 +4386,29 @@ sub load_lsb_release {
       chomp $l;
       my ($k,$v) = split(/=/, $l, 2);
       $d{$k} = $v;
+    }
+    return \%d;
+  }
+  return undef;
+}
+
+sub get_macos_version {
+  my $fh = new FileHandle;
+  my $fSystemVersion = '/System/Library/CoreServices/SystemVersion.plist';
+  if (-f $fSystemVersion && open($fh,'<',$fSystemVersion)) {
+    my @lines = <$fh>;
+    close $fh;
+    my %d = ();
+    my ($k,$v) = (undef,undef);
+    foreach my $l (@lines) {
+      chomp $l;
+      next if ($l !~ m/\s*<(key|string)>/);
+      if ($l =~ m/\s*<key>([^<]+)</) { $k = $1; }
+      if ($l =~ m/\s*<string>([^<]+)</) { $v = $1; }
+      if (defined($k) && defined($v)) {
+        $d{$k} = $v;
+        ($k,$v) = (undef,undef);
+      }
     }
     return \%d;
   }
@@ -4305,7 +4520,8 @@ sub GetPassword {
 sub MyGetOpts {
   my %opts=();
   my $result = &GetOptions(\%opts, "kdb=s", "key=s", "pwfile=s", "histfile=s",
-	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s");
+	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s",
+	"pwsplchars=s", "xpxsecs=i");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -4324,6 +4540,37 @@ sub MyGetOpts {
     }
   }
 
+  # Sanity check the use of --pwsplchars
+  my @sc_warns = ();
+  if (defined($opts{'pwsplchars'})) {
+    if (!(length($opts{'pwsplchars'}))) {
+      push @sc_warns, "You removed all special characters."
+    }
+    my $sc_minus_underscore = $opts{'pwsplchars'};
+    $sc_minus_underscore =~ s/_//g;
+    if ($sc_minus_underscore =~ m/\w/) {
+      push @sc_warns, "Contains normal word characters.";
+    }
+    if ($opts{'pwsplchars'} =~ m/[^[:print:]]/) {
+      push @sc_warns, "Contains non-printable characters.";
+    }
+    my @sc = split(//, $opts{'pwsplchars'});
+    if (scalar(@sc) != scalar(uniq(@sc))) {
+      push @sc_warns, "One or more characters are duplicated.";
+    }
+    if (scalar(@sc_warns)) {
+      print color('bold yellow') .
+	"WARNING(s) regarding --pwsplchars for password generation:\n" .
+	color('clear') . color('yellow') .
+		' * ' . join("\n * ", @sc_warns) . "\n" .
+	color('clear');
+    }
+  } else {
+    $opts{'pwsplchars'} = '_'; # The default list is just underscore
+  }
+  my @special_chars = split(//, $opts{'pwsplchars'});
+  $opts{'pwsplchars'} = \@special_chars;
+
   my @errs=();
   if ((length($opts{kdb}) && (! -e $opts{kdb}))) {
     push @errs, "for option --kdb=<file.kbd>, the file must exist.";
@@ -4333,10 +4580,20 @@ sub MyGetOpts {
     push @errs, "for option --key=<file.key>, the file must exist.";
   }
 
+  if (length($opts{xpxsecs})) {
+    if (! ($opts{xpxsecs} =~ m/^\d+$/)
+		|| $opts{xpxsecs} < 1 || $opts{xpxsecs} > 60 ) {
+      push @errs, "--xpxsecs must be between 1 and 60.";
+    }
+  } else {
+    $opts{xpxsecs} = 10; # Default is 10 seconds
+  }
+
   if (scalar(@errs)) {
     warn "There were errors:\n" .
 	"  " . join("\n  ", @errs) . "\n\n";
-    die &GetUsageMessage();
+    print &GetUsageMessage();
+    exit;
   }
 
   return \%opts;
@@ -4353,6 +4610,10 @@ sub GetUsageMessage {
     [ command => 'Run single command and exit (no interactive session).' ],
     [ 'no-recycle' =>
 		'Don\'t store entry changes in /Backup or "/Recycle Bin".' ],
+    [ 'pwsplchars' =>
+		'Specify the special characters used in password generation.' ],
+    [ 'xpxsecs' =>
+		'Seconds to wait until clearing the clipboard for xpx.' ],
     [ help => 'This message.' ],
   );
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
@@ -4703,8 +4964,8 @@ sub generatePassword {
 
 sub generatePasswordGobbledygook {
   my $length = shift;
+  my @special_chars=@{$opts->{'pwsplchars'}};
   my @normal_chars=('a'..'z','A'..'Z',0..9);
-  my @special_chars=qw(_);
   my $charset = join('', (@normal_chars,@special_chars));
   # Generate the password
   my $password = '';
@@ -5003,6 +5264,39 @@ sub setup_signal_handling {
   #$SIG{CONT} = $handler_SIGCONT; # Works only if $ENV{PERL_SIGNAL}='unsafe'
 }
 
+# 2FA-TOTP support
+sub have_otp_support() {
+  if (! $state->{OPTIONAL_PM}->{'Authen::OATH'}->{loaded}) {
+    return(0, "Module Authen::OATH is required for OTP support.");
+  }
+  if (! $state->{OPTIONAL_PM}->{'Convert::Base32'}->{loaded}) {
+    return(0, "Module Convert::Base32 is required for OTP support.");
+  }
+  return(1,undef);
+}
+sub get_otp_data_from_comment($) {
+  my $comment = shift @_;
+  my @comment_lines = split(/[\r\n]+/, $comment);
+  my $key2FA = undef;
+  my $digest = undef;
+  CLINES: foreach my $cline (@comment_lines) {
+    if ($cline =~ m/^2FA-TOTP(-([^:]+))?:\s*([^\s]+)/) {
+      $key2FA = $3;
+      $digest = $2 || 'SHA'; # RFC6238 uses SHA-1 == Digest::SHA
+      last CLINES;
+    }
+  }
+  return($key2FA,$digest);
+}
+
+sub get_totp($$) {
+  my $key2FA = shift @_ || '';
+  my $digest = shift @_ || 'SHA'; # RFC6238 uses SHA-1 == Digest::SHA
+  my $oath = Authen::OATH->new( digest => 'Digest::'.uc($digest) );
+  my $otp = $oath->totp(decode_base32($key2FA));
+  return $otp;
+}
+
 #########################################################################
 # Setup timeout handling (--timeout=N) ##################################
 #########################################################################
@@ -5066,7 +5360,9 @@ sub runtime_load_module {
 						scalar(@$rImportList) > 0) {
     $iltxt = "('" . join("','", @{$rImportList}) . "')";
   }
-  if (eval "require $module;$module->import($iltxt);1;" eq 1) {
+  my $eval_result = eval("require $module;$module->import($iltxt); 1;");
+  if (! defined($eval_result)) { $eval_result = 0; }
+  if ($eval_result == 1) {
     $rOPTIONAL_PM->{$module}->{loaded} = 1;
     return 1;
   } else {
@@ -5169,10 +5465,12 @@ sub get_readline_term {
   #    we do not want all those inputs in the history file (cruft).
   if ($rl_term->ReadLine eq 'Term::ReadLine::Perl') {
     no strict 'refs';
+    no warnings 'once'; # This is intentionally only used once
     *readline::add_line_to_history = sub { return undef; };
   }
   if ($rl_term->ReadLine eq 'Term::ReadLine::Perl5') {
     no strict 'refs';
+    no warnings 'once'; # This is intentionally only used once
     *Term::ReadLine::Perl5::readline::add_line_to_history = sub {return undef;}
   }
 
@@ -5280,7 +5578,7 @@ You can optionally install C<Term::ReadLine::Perl5>, which is often
 preferred on platforms without GNU readline (MacOS, Windows, etc.)
 
 You can optionally install C<Clipboard> and C<Tiny::Capture> to use the
-clipboard features; http://search.cpan.org/~king/Clipboard/ and
+clipboard features; https://metacpan.org/pod/Clipboard and
 libcapture-tiny-perl on Ubuntu 10.04.
 
 You can optionally install C<Sub::Install> to use the --timeout feature.
@@ -5304,6 +5602,10 @@ cpanminus installs it nicely on Linux Mint (https://cpanmin.us/).
 
 You can optionally install C<Math::Random::ISAAC> in order to use a
 more secure rand() function. Package libmath-random-isaac-perl on Debian.
+
+You can optionally install C<Authen::OATH> and C<Convert::Base32> to use
+the TOTP one time password functionality (RFC 6238).  Those are packages
+libauthen-oath-perl and libconvert-base32-perl on Debian.
 
 On MS Windows, you can optionally install C<Win32::Console::ANSI> to get
 ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
@@ -5577,8 +5879,39 @@ this program would not have been practical for me to author.
                   - Mark /_found entries as "*OLD" when listed, if
                      they reside in a group named old. Addresses an
                      issue where searches turn up "old" accounts.
+ 2020-Apr-25 v3.4 - Marking of "*OLD" /_found entries now includes
+                     those having any "old" group in the entire path.
+                  - Added get_macos_version() and now report more
+                     details for macOS in the vers command.
+                  - Test for a new enough version of Clipboard if on
+                     macOS 10.15.0 or newer. See SF bug #41.
+                  - Added some vers reporting of a few OS-specific
+                     modules (around clipboard functionality).
+                  - Added the "ver -vv" and "vers -v" options, for
+                     addional verbosity of version reporting.
+                  - Added --pwsplchars option, as requested in
+                     SourceForge feature request #19.
+                  - Fixed a few new "perl -cw" warnings.
+                  - Added "use diagnostics" and cleaned up some items
+                     that it pointed out.
+                  - Added Google Authenticator style 2FA-TOTP support,
+                     and with it the otp and xo commands.
+                  - Added --xpxsecs option, as requested in
+                     SourceForge feature request #20.
 
 =head1 TODO ITEMS
+
+  Consider adding support for TOTP with different digest algorithms
+  than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
+  the TOTP time to be something other than 30 seconds and the length
+  of the OTP to be something other than six digits. None of those
+  options are broadly used today, but when writing the TOTP code, I
+  stumbled across a few. I did not implement it now primarily because
+  Authen::OATH isn't very condusive to using other digest algorithms.
+  For future reference, I'd likely construct the strings like this:
+    2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
+  This code may prove useful if I decide to not use Authen::OATH:
+  https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
 
   Consider broadening shell_expansion support beyond just mv and ls.
 
@@ -5603,6 +5936,7 @@ Unix-like
  - As of version 3.0, development is done on Linux Mint 17.
  - Known to work on many other Linux and *BSD distributions, and
    kpcli is packaged with many distributions now-a-days.
+ - Known to work on macOS and is packaged in Homebrew (brew.sh).
 
 Microsoft Windows
  - As of v2.4, Microsoft Windows is also supported.
