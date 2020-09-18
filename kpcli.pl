@@ -15,7 +15,10 @@
 #
 ###########################################################################
 
-# The required perl modules
+########################
+# The required modules #
+########################
+# Required core modules
 use 5.9.4;   # Version when Module::Loaded was added
 use strict;                                   # core
 use version;                                  # core
@@ -38,12 +41,71 @@ use Time::Piece;                              # core
 use Time::Seconds;                            # core
 use Module::Loaded qw(is_loaded);             # core
 use POSIX;                   # core, required for unsafe signal handling
+
+# This BEGIN code is used to unshift local perl module paths (~/perl5/*)
+# onto @INC to allow users to install modules for kpcli into thier homedirs
+# instead of having to do it at the system level. This is convenient with
+# cpanm and can be helpful on hosts without root privilege.
+BEGIN {
+  # Bail immediately if we're on Windows
+  if (lc($^O) =~ m/^mswin/) { return 0; }
+
+  use File::Find qw(find); # In core perl since v5.8.0
+
+  # cPanelUserConfig.pm was the reference code from which I
+  # built this, but I modified it substantially, to the
+  # point that it is really not the same any longer and, I
+  # believe, should work on many more unix-like systems.
+  # I also added checks so that we don't push non-existant
+  # directories onto @INC.
+  # NOTE: An alternative to this may be CPAN module local::lib,
+  # but it would bring in many more dependancies...
+
+  # $b__dir will be something like /home/<user>/perl5
+  my $b__dir = ( getpwuid($>) )[7] . '/perl5';
+  if (! -d $b__dir) { return 0; } # Nothing to do if no ~/perl5/
+
+  # Find all of .../auto/ directories in ~/perl5, chop the /auto off,
+  # and append that list of directories to @add_paths.
+  my @auto_dirs;
+  find(sub {
+           push @auto_dirs,$File::Find::name
+		if (-d $File::Find::name && $File::Find::name =~ m%/auto$%);
+      }, $b__dir );
+  foreach my $i (0..$#auto_dirs) {
+    $auto_dirs[$i] =~ s%/auto$%%;
+  }
+  #warn "LHHD: \@auto_dirs:\n" . join("\n", @auto_dirs) . "\n\n";
+
+  # Potential base set of ~/perl5 paths to be placed into @INC
+  my @add_paths = ( $b__dir.'/lib/perl5', @auto_dirs );
+
+  # Potential complete set of ~/perl5 paths to be placed into @INC
+  my @INC_adds = ();
+  unshift @INC_adds, @add_paths, map { $b__dir . $_ } grep {$_ ne '.'} @INC;
+
+  # Any @INC_adds that exist will go into @INC_toadd to be unshifted to @INC
+  my @INC_toadd = ();
+  foreach my $inc_add (@INC_adds) {
+    if (-d $inc_add) { push @INC_toadd, $inc_add; }
+  }
+
+  #warn "LHHD: \@INC_adds:\n" . join("\n", @INC_adds) . "\n\n";
+  #warn "LHHD: \@INC_toadd:\n" . join("\n", @INC_toadd) . "\n\n";
+  unshift @INC, @INC_toadd;
+  #warn "LHHD: \@INC:\n" . join("\n", @INC) . "\n\n";
+}
+
+# Required non-core modules
 use Crypt::Rijndael;         # non-core, libcrypt-rijndael-perl on Ubuntu
 use Sort::Naturally;         # non-core, libsort-naturally-perl on Ubuntu
 use Term::ReadKey;           # non-core, libterm-readkey-perl on Ubuntu
 use Term::ShellUI;           # non-core, libterm-shellui-perl on Ubuntu
 use File::KeePass 0.03;      # non-core, libfile-keepass-perl on Ubuntu
                              #  - >=v0.03 needed due critical bug fixes
+##############################
+# End of required modules ####
+##############################
 
 # A developer convenience to force using a particular Term::ReadLine module
 our $FORCED_READLINE = undef;	# Auto-select
@@ -57,7 +119,7 @@ my %OPTIONAL_PM=();
 # Clipboard is needed by the clipboard copy commands (xw, xu, xp, and xx).
 if (runtime_load_module(\%OPTIONAL_PM,'Capture::Tiny',[qw(capture)])) {
   # Clipboard tests its dependencies at import() and writes warnings to STDERR.
-  # Tiny::Capture is used to catch those warnings and we silently hold them
+  # Capture::Tiny is used to catch those warnings and we silently hold them
   # until and unless someone tries to use dependant functions.
   my ($out, $err, @result) = capture(
 		sub { runtime_load_module(\%OPTIONAL_PM,'Clipboard',undef); } );
@@ -70,14 +132,21 @@ if (runtime_load_module(\%OPTIONAL_PM,'Capture::Tiny',[qw(capture)])) {
   # If we didn't get Capture::Tiny, also mark Clipboard as not loaded.
   $OPTIONAL_PM{'Clipboard'}->{loaded} = 0;
 }
-# Win32::Console::ANSI is needed to emulate ANSI colors on Windows
+# Optional but helpful modules for Windows
 if (lc($OSNAME) =~ m/^mswin/) {
+  # Win32::Console::ANSI is needed to emulate ANSI colors on Windows
   if (! runtime_load_module(\%OPTIONAL_PM,'Win32::Console::ANSI',undef)) {
     # If we don't have Win32::Console::ANSI then we want to override
     # &main::color() and colored() from Term::ANSIColor with NOOPs.
     no strict 'refs';
     *color = sub { my $color = shift @_; return ''; };
     *colored = sub { my $color = shift @_; my $text=shift @_; return $text; };
+  }
+  # In version 3.5, added the use of Term::Size::Win32 to deal with a
+  # problem when importing Term::ReadLine::Perl where it warns about
+  # "The Win32 GetConsoleScreenBufferInfo call didn't work."
+  if (! runtime_load_module(\%OPTIONAL_PM,'Term::Size::Win32',undef)) {
+    # TODO - should we do something here...?
   }
 }
 runtime_load_module(\%OPTIONAL_PM,'Sub::Install',undef);
@@ -117,7 +186,7 @@ my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.4";
+my $VERSION = "3.5";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 my $opts = MyGetOpts(); # Will only return with options we think we can use
@@ -262,9 +331,10 @@ my $term = new Term::ShellUI(
 		"and entries to another KeePass database file on disk,\n" .
 		"starting at your current path (pwd).\n" .
 		"\n" .
-		"This is also a \"safer\" way to change your database\n" .
-		"password. Export from /, verify that the new file is\n" .
-		"good, and then remove your original file.\n",
+		"This is a safer way to change your database password or\n" .
+		"to move between v1 (*.kdb) and v2 (*.kdbx) file formats.\n" .
+		"Export from /, verify that the new file is good, and then\n" .
+		"remove your original file.\n",
              minargs => 1, maxargs => 2,
              args => [\&Term::ShellUI::complete_onlyfiles,
 					\&Term::ShellUI::complete_onlyfiles],
@@ -412,11 +482,13 @@ my $term = new Term::ShellUI(
 		"https://en.wikipedia.org/wiki/Google_Authenticator\n" .
 		"\n" .
 		"To configure an entry for this feature, place a line in\n" .
-		"in the entry's comments, as follows:\n" .
+		"in the entry's Comments, as follows:\n" .
 		"\n" .
 		"2FA-TOTP: TheBase32SecretKeyProvided\n" .
 		"\n" .
 		"The show command also provides OTPs for those entries.\n" .
+		"The show command redacts 2FA secrets from the Comments\n" .
+		"unless both the -a and -f flags are given.\n" .
 		"",
              minargs => 1, maxargs => 3,
              args => \&complete_groups_and_entries,
@@ -499,7 +571,7 @@ my $term = new Term::ShellUI(
              method => \&cli_find,
          },
          "purge" => {
-             desc => "Purges entries in a given group base on criteria.",
+             desc => "Purges entries in a given group based on criteria.",
              doc => "\n" .
 		"Purges entries within a given group based on the age of\n" .
 		"the created, accessed, modified, or expiration fields.\n" .
@@ -537,10 +609,11 @@ our $state={
 	'last_activity_time' => 0, # initilized by setup_timeout_handling()
 	};
 # If given --kdb=, open that file
-if (length($opts->{kdb})) {
+if (defined($opts->{kdb}) && length($opts->{kdb})) {
   my $err = open_kdb($opts->{kdb}, $opts->{key}); # Sets $state->{'kdb'}
   if (length($err)) {
-    print "Error opening file: $err\n";
+    print "$err\n";
+    exit -1; # We exit if we failed to load the --kdb file
   }
 } else {
   new_kdb($state);
@@ -575,7 +648,7 @@ setup_signal_handling();  # Exactly what the name indicates...
 
 # Setup the inactivity timeout feature (--timeout).
 if (defined($opts->{timeout}) && int($opts->{timeout}) > 0) {
-  if  (! $state->{OPTIONAL_PM}->{'Sub::Install'}->{loaded}) {
+  if  (! is_loaded('Sub::Install')) {
     print "Error: --timeout requires the Sub::Install module.\n";
     exit;
   }
@@ -598,6 +671,7 @@ exit;
 sub open_kdb {
   my $file=shift @_;
   my $key_file=shift @_;
+  my $password=shift @_ || undef;
   our $state;
 
   # Make sure the file exists, is readable, and is a keepass file
@@ -633,6 +707,8 @@ sub open_kdb {
     $master_pass=<$pwdfile>;
     chomp $master_pass;
     close($pwdfile);
+  } elsif (defined($password) && length($password)) {
+    $master_pass = $password;
   } else {
     # Ask the user for the master password and then open the kdb
     $master_pass=GetMasterPasswd();
@@ -641,7 +717,7 @@ sub open_kdb {
   $state->{kdb} = File::KeePass->new;
   if (! eval { $state->{kdb}->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
-    die "Couldn't load the file $file: $@";
+    return "Couldn't load the file $file\nError(s) from File::KeePass:\n$@";
   }
 
   if (defined($state->{placed_lock_file})) {
@@ -896,12 +972,13 @@ sub group_sort($$) {
 # All of the cli_*() functions are below here
 # -------------------------------------------------------------------------
 
-# A simple wrapper function to block SIGTSTP (^Z) during certain commands
+# A simple wrapper function to block SIGTSTP (^Z) during certain commands.
+# This is not available on Windows, thus the if(defined()) calls.
 sub run_no_TSTP {
   my $func = shift @_;
-  $SIG{TSTP}='IGNORE';
+  if (defined($SIG{TSTP})) { $SIG{TSTP}='IGNORE'; }
   my @retval = &$func(@_);
-  $SIG{TSTP}='DEFAULT';
+  if (defined($SIG{TSTP})) { $SIG{TSTP}='DEFAULT'; }
   return @retval;
 }
 
@@ -919,7 +996,7 @@ sub cli_pwck {
   my $pwckMethod = '';
   pwckModules: foreach my $pwckmod (@pwckModules) {
     # If it's already loaded then set $pwckMethod and bail out now
-    if ($state->{OPTIONAL_PM}->{$pwckmod}->{loaded}) {
+    if (is_loaded($pwckmod)) {
       $pwckMethod = $pwckmod;
       last pwckModules;
     }
@@ -1058,7 +1135,7 @@ sub my_IsBadPassword($) {
   my $result = undef;
   if ($pwckMethod eq 'Data::Password') {
     $result = Data::Password::IsBadPassword($pass);
-    if ($result =~ m/dictionary word/i) {
+    if (defined($result) && $result =~ m/dictionary word/i) {
       # IsBadPassword() reports dictionary words that it finds. I don't
       # like that from a security perspective so we change that here.
       $result = "contains a dictionary word";
@@ -1114,27 +1191,35 @@ sub cli_stats {
     }
   }
 
+  my $kdb_fname = 'N/A'; # N/A is it's a new, never saved file.
+  if (defined($state->{kdb_file})) { $kdb_fname = $state->{kdb_file}; }
   my $t= " "x20 . "\r" .
-	"File: " . $state->{kdb_file} . "\n" .
+	"File: $kdb_fname\n" .
 	"Key file: " .
 	(defined($state->{key_file}) ? $state->{key_file} : 'N/A') . "\n";
-  if (defined($k->{header}->{database_name})) {
-    $t.="Name: " . $k->{header}->{database_name} . "\n";
+  # Note: the defined() tests below are needed because newly created
+  # files, that have not yet been saved, won't have those values.
+  my $hdr = $k->{header};
+  if (defined($hdr->{database_name})) {
+    $t.="Name: " . $hdr->{database_name} . "\n";
   }
-  if (defined($k->{header}->{database_description})) {
-    my $desc = $k->{header}->{database_description};
+  if (defined($hdr->{database_description})) {
+    my $desc = $hdr->{database_description};
     $desc =~ s/[\r\n]/\n/g;
     my @l = split(/\n/, $desc);
     $t .= "Description:\n" . "| " . join("\n| ", @l) . "\n";
   }
-  $t .= "KeePass file version: " . $k->{header}->{version} . "\n" .
-	"Encryption type:      " . $k->{header}->{enc_type} . "\n" .
-	"Encryption rounds:    " . $k->{header}->{rounds} . "\n";
-  if (defined($k->{header}->{cipher})) {
-    $t.="Cipher:               $stats{cipher}\n";
+  if (defined($hdr->{version}) && defined($hdr->{enc_type}) &&
+					defined($hdr->{rounds})) {
+    $t .= "KeePass file version: " . $hdr->{version} . "\n" .
+	  "Encryption type:      " . $hdr->{enc_type} . "\n" .
+	  "Encryption rounds:    " . $hdr->{rounds} . "\n";
   }
-  if (defined($k->{header}->{compression})) {
-    $t.="Compression:          $stats{compression}\n";
+  if (defined($hdr->{cipher})) {
+    $t .= "Cipher:               $hdr->{cipher}\n";
+  }
+  if (defined($hdr->{compression})) {
+    $t .= "Compression:          $hdr->{compression}\n";
   }
   $t .= "Number of groups:     $stats{group_count}\n" .
 	"Number of entries:    $stats{entry_count}\n" .
@@ -1146,7 +1231,7 @@ sub cli_stats {
 
 sub cli_cls {
   if (lc($OSNAME) =~ m/^mswin/ &&
-		(! $OPTIONAL_PM{'Win32::Console::ANSI'}->{loaded})) {
+		(! is_loaded('Win32::Console::ANSI'))) {
     system("cls");
   } else {
     print "\033[2J\033[0;0H";
@@ -1557,7 +1642,10 @@ sub cli_find($) {
     $new_ent{path} = dirname($new_ent{full_path}) . '/';
     if (defined($duplicates{$new_ent{full_path}})) { next FINDS; }
     $duplicates{$new_ent{full_path}} = 1;
-    # Do duplicate title detection and modify any duplicates by adding a count to te title
+    # Do duplicate title detection and modify any duplicates by adding a count to the title
+    if (! defined($duplicate_titles{$new_ent{title}})) {
+      $duplicate_titles{$new_ent{title}} = 0; # To suppress diagnostics warnings
+    }
     $duplicate_titles{$new_ent{title}} = int($duplicate_titles{$new_ent{title}}) + 1;
     if ($duplicate_titles{$new_ent{title}} > 1) {
       $new_ent{title} = $new_ent{title} . " (" . $duplicate_titles{$new_ent{title}} . ")";
@@ -1790,7 +1878,7 @@ sub cli_xN($$) {
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   # If Clipboard is not avaiable we can't do this for the user
-  if  (! $state->{OPTIONAL_PM}->{'Clipboard'}->{loaded}) {
+  if  (! is_loaded('Clipboard')) {
     print "Error: $xNcmd requires the Clipboard and Capture::Tiny modules:\n" .
 	" - https://metacpan.org/pod/Clipboard\n" .
 	" - https://metacpan.org/pod/Capture::Tiny\n" .
@@ -1824,7 +1912,7 @@ sub cli_xN($$) {
 
   # If we're clearing the clipboard, just do that and return immediately.
   if ($xNcmd eq 'xx') {
-    Clipboard->copy('');
+    my_clipboard_copy('');
     print "Clipboard cleared.\n";
     return;
   }
@@ -1871,7 +1959,7 @@ sub cli_xN($$) {
 	'xo' => 'OTP',
 	};
   if (defined($to_copy)) {
-    Clipboard->copy($to_copy);
+    my_clipboard_copy($to_copy);
     print "Copied $cp_map->{$xNcmd} for \"$ent->{title}\" to the clipboard.\n";
   }
 
@@ -1888,12 +1976,41 @@ sub cli_xN($$) {
       }
     }
     print "\n";
-    Clipboard->copy('');
+    my_clipboard_copy('');
     print "Clipboard cleared.\n";
     return;
   }
 
   return;
+}
+
+sub my_clipboard_copy($) {
+  my $text_to_copy = shift @_;
+  # X11 has multiple clipboards and we allow users control over which
+  # one(s) to copy to. Without --xclipsel set, Clipboard::Xclip->copy()
+  # defaults to primary (the middle mouse click clipboard).
+  if ($Clipboard::driver eq 'Clipboard::Xclip' && length($opts->{xclipsel})) {
+    if ($opts->{xclipsel} eq 'all') {
+      # Clipboard v0.19 (2019-01-31) and newer have copy_to_all_selections()
+      # but prior do not. Prior versions are still commonly in use, and
+      # so I chose to support them. At a later date, the else statement
+      # here could be removed and we could instead insist on a newer
+      # version of Clipboard. TODO
+      if (Clipboard->can('copy_to_all_selections')) {
+        Clipboard->copy_to_all_selections($text_to_copy);
+      } else {
+        my @x11_sels = $Clipboard::driver->all_selections();
+        foreach my $sel (@x11_sels) {
+          $Clipboard::driver->copy_to_selection($sel, $text_to_copy);
+        }
+      }
+    } else {
+      # Clipboard has no copy_to_selection(), but Clipboard::Xclip does
+      $Clipboard::driver->copy_to_selection($opts->{xclipsel}, $text_to_copy);
+    }
+  } else {
+    Clipboard->copy($text_to_copy);
+  }
 }
 
 sub cli_rm($) {
@@ -2324,7 +2441,7 @@ sub cli_show($$) {
   }
   # 2FA-TOTP generation
   my $otp = undef;
-  if ($state->{OPTIONAL_PM}->{'Authen::OATH'}->{loaded}) {
+  if (is_loaded('Authen::OATH')) {
     my ($key2FA,$digest) = get_otp_data_from_comment($ent->{comment});
     if (defined($key2FA) && defined($digest)) {
       my ($otp_supported, $reason) = have_otp_support();
@@ -2340,13 +2457,21 @@ sub cli_show($$) {
   if (defined($ent->{path})) {
     print show_format("Path",$ent->{path}) . "\n";
   }
+  # Only show the 2FA key if both -a and -f are given
+  my $notes = $ent->{comment};
+  if (! (defined($opts{a}) && defined($opts{f})) ) {
+    my ($key2FA,$digest) = get_otp_data_from_comment($ent->{comment});
+    if (defined($key2FA) && length($key2FA)) {
+      $notes =~ s/\Q$key2FA\E/<redacted>/g;
+    }
+  }
   print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
 	show_format("Pass",$password) . "\n" .
 	(defined($otp) ? show_format("OTP",$otp) . "\n" : '') .
 	show_format("URL",$ent->{url}) . "\n" .
-	show_format("Notes",$ent->{comment}) . "\n" .
+	show_format("Notes",$notes) . "\n" .
 	($DEBUG ? show_format("ID",$ent->{id}) . "\n" : '');
   # Tags were added to KeePass in v2.11 (*.kdbx)
   if (defined($ent->{tags}) && length($ent->{tags})) {
@@ -2536,7 +2661,7 @@ sub _entry_edit_gui($$$) {
   my @fields = get_entry_fields($kdb_ver);
   foreach my $input (@fields) {
     my $current_val = $ent->{$input->{key}};
-    my $val = '';
+    my $val = undef;
     if (defined($input->{user_prep_func})) {
       $current_val = $input->{user_prep_func}($current_val);
     }
@@ -2550,7 +2675,7 @@ sub _entry_edit_gui($$$) {
     # If the user hit ^C (SIGINT) then we need to stop
     if (recent_sigint()) { return -1; }
     # Call the validate_func if it's defined
-    if (defined($input->{validate_func}) && length($val)) {
+    if (defined($input->{validate_func}) && defined($val)) {
       # Note that $val can be modified by the validate_func
       if ($input->{validate_func}(\$val) != 0) {
         print "Invalid $input->{txt} input.\n";
@@ -2558,7 +2683,7 @@ sub _entry_edit_gui($$$) {
       }
     }
     # Check a new title for same-name conflicts in its group
-    if ($input->{key} eq 'title' && length($val)) {
+    if ($input->{key} eq 'title' && defined($val)) {
       if ($val =~ m/\//) {
         print "kpcli cannot support titles with slashes (/) in them.\n";
         return -1;
@@ -2570,8 +2695,8 @@ sub _entry_edit_gui($$$) {
         return -1;
       }
     }
-    # If the field was not empty, we'll change it to the new $val
-    if (length($val)) { $rChanges->{$input->{key}} = $val; }
+    # If the field was not undefined, we'll change it to the new $val
+    if (defined($val)) { $rChanges->{$input->{key}} = $val; }
   }
   return 0;
 }
@@ -2632,7 +2757,7 @@ sub edit_entry_strings {
     COMMAND: while (my $key=get_single_key()) {
       if (lc($key) eq 'c' || ord($key) == 3) { # Cancel or ^C
         print "\n";
-        return ''; # We are to return nothing on no change
+        return undef; # We are to return undef on no change
       } elsif ($key =~ m/^[fF\r\n]$/) { # Finished (save)
         print "\n";
         return $tmp_ent->{strings};
@@ -2708,6 +2833,15 @@ sub new_edit_single_line_input($$) {
   my $initial_value = shift @_;
   our $state;
 
+  # Because we don't unlock entries to edit them, the password
+  # field comes in as undef. That is not a problem except that
+  # "use diagnostics" will warn below, where we test for
+  # "$val eq $initial_value" and return undef if true. To prevent
+  # that warning, I set initial_value='' here for password.
+  if ($input->{key} eq 'password' && !defined($initial_value)) {
+    $initial_value = '';
+  }
+
   my $iv = ''; if (! $input->{hide_entry}) { $iv = $initial_value; }
   my $term = get_prepped_readline_term();
   my $val = '';
@@ -2752,7 +2886,7 @@ sub new_edit_single_line_input($$) {
         die "BUG: it should be impossible to get to this code!\n";
       }
     } elsif (length($val) && $input->{double_entry_verify}) {
-      my $prompt = "Retype to verify: ";
+      my $prompt = "Please retype to verify: ";
       my $checkval = '';
       if ($input->{hide_entry}) {
         $checkval = GetPassword($prompt, '');
@@ -2773,8 +2907,8 @@ sub new_edit_single_line_input($$) {
     $term->Attribs->{startup_hook} = undef;
     $term->Attribs->{event_hook} = undef;
   }
-  # This funciton is supposed to return blank if nothing changed
-  if ($val eq $initial_value) { $val = ''; }
+  # This function is supposed to return undef if nothing changed
+  if ($val eq $initial_value) { $val = undef; }
   return $val;
 }
 # Multi-line input helper function for cli_new and cli_edit.
@@ -2806,6 +2940,10 @@ sub new_edit_multiline_input($$) {
     # (it borks on ''), but after adding the pipe I liked it so left
     # it place for all readlines.
     my $line = $term->readline('| ');
+    if (! defined($line)) {   # Handles user hitting Ctrl-D
+      print "\r";
+      next;
+    }
     if ($line =~ m/^\.[\r\n]*$/) { # a lone "." ends our input
       $unfinished = 0;
     } else {
@@ -2817,6 +2955,8 @@ sub new_edit_multiline_input($$) {
     if (recent_sigint()) { return undef; }
   }
   chomp($val); # Remove extra line at the end
+  # This function is supposed to return undef if nothing changed
+  if ($val eq '') { $val = undef; }
   return $val;
 }
 
@@ -2846,10 +2986,21 @@ sub stats_print($) {
   }
   my $sprintf_format = "  - %$max_key_len" . "s: %$max_val_len" . "d\n";
   my $t='';
-  foreach my $stat_key (sort {$a <=> $b} keys %{$stats_r}) {
+  foreach my $stat_key (sort {toint($a) <=> toint($b)} keys %{$stats_r}) {
     $t .= sprintf($sprintf_format, $stat_key, $stats_r->{$stat_key});
   }
   return $t;
+}
+# Helper function for stats_print()
+sub toint($) {
+  my $range = shift @_;
+  if ($range =~ m/^[0-9]+$/) { return $range; }		# 0
+  if ($range =~ m/^([0-9]+)-[0-9]+$/) { return $1; }	# 1-7
+  if ($range =~ m/^([0-9]+)[+]$/) { return $1; }	# 20+
+  # We should never get here, but if we do, this is the fallback
+  my $retval = $range;
+  $retval =~ s/[^0-9]//g;
+  return $retval;
 }
 
 # Helper functions to normalize and humanize entry tags
@@ -3051,17 +3202,21 @@ sub cli_new($) {
     my $val = '';
     if (defined($input->{user_edit_func})) {
       $val = $input->{user_edit_func}($new_entry, $input, {});
-      # An empty hash-ref is "empty/blank" for strings, but the
-      # user_edit_func returns the scalar '' in that case.
-      if ($input->{key} eq 'strings' && ref($val) ne 'HASH') { $val = {}; }
+      # An empty hash-ref is "empty/blank" for strings, but here, for a
+      # new entry, the user_edit_func returns undef in that case (no change).
+      if ($input->{key} eq 'strings' && !defined($val)) { $val = {}; }
     } elsif ($input->{multiline}) {
-      $val = new_edit_multiline_input($input, '');
+      # If the user does not change the default input, undef is returned,
+      # thus the need for the "|| ''" at the end of this.
+      $val = new_edit_multiline_input($input, '') || '';
     } else {
       if ($new_title ne '' && $input->{key} eq 'title') {
         print $input->{txt} . ": $new_title\n";
         $val = $new_title;
       } else {
-        $val = new_edit_single_line_input($input, '');
+        # If the user does not change the default input, undef is returned,
+        # thus the need for the "|| ''" at the end of this.
+        $val = new_edit_single_line_input($input, '') || '';
       }
     }
     # If the user hit ^C, abort the new entry
@@ -3169,10 +3324,10 @@ sub cli_import_pwsafe3 {
   our $state;
 
   # This requires Crypt::PWSafe3 so try to load it if we don't have it
-  if  (! $state->{OPTIONAL_PM}->{'Crypt::PWSafe3'}->{loaded}) {
+  if  (! is_loaded('Crypt::PWSafe3')) {
     runtime_load_module(\%OPTIONAL_PM,'Crypt::PWSafe3',[qw(capture)]);
   }
-  if  (! $state->{OPTIONAL_PM}->{'Crypt::PWSafe3'}->{loaded}) {
+  if  (! is_loaded('Crypt::PWSafe3')) {
     print "Perl module Crypt::PWSafe3 is required for this functionality.\n";
     return -1;
   }
@@ -3367,9 +3522,16 @@ sub cli_export($$) {
     }
   }
   $k->lock;
+
+  # File::KeePass defaults to v1 (*.kdb) and if the user is asking
+  # to export to v2 (*.kdbx) we need to override that default.
+  if ($file =~ m/[.]kdbx$/) {
+    $new_kdb->{header}->{version} = 2;
+  }
+
+  # Generate the new kdb/kdbx file into the $new_db_bin variable
   $new_kdb->unlock;
-  my $new_db_bin =
-		$new_kdb->gen_db(composite_master_pass($master_pass,$key_file));
+  my $new_db_bin=$new_kdb->gen_db(composite_master_pass($master_pass,$key_file));
   $new_kdb->lock;
 
   # Test parsing the kdb from RAM (we'll most likely die if this fails)
@@ -3381,7 +3543,8 @@ sub cli_export($$) {
   if (open($fh,'>',$file)) {
     print $fh $new_db_bin;
     close $fh;
-    print "Exported to $file\n";
+    my $ver = "v" . $new_db->{header}->{version};
+    print "Exported KeePass $ver format to $file\n";
   } else {
     print "Could not open \"$file\" for writing.\n";
   }
@@ -3498,26 +3661,22 @@ sub cli_saveas($) {
   $state->{kdb}->save_db($file,composite_master_pass($master_pass,$key_file));
   $state->{kdb}->lock;
 
-  $state->{kdb}= File::KeePass->new;
-  if (! eval { $state->{kdb}->load_db($file,
-			composite_master_pass($master_pass,$key_file)) }) {
-    die "Couldn't load the file $file: $@";
-  }
-
-  # We hold a read file handle open for no reason other than
-  # to show up in lsof.
+  # Properly close and remove lock file before the reopen below.
+  # This snipped of code was copied from sub cli_close.
+  $state->{'kdb'}->clear();
+  new_kdb($state); # Note, this removes the old *.lock file
   if (defined($state->{kdb_file_handle})) {
     close $state->{kdb_file_handle};
   }
-  $state->{kdb_file_handle} = new FileHandle;
-  open($state->{kdb_file_handle}, '<', $file);
 
-  $state->{kdb_file} = $file;
-  $state->{kdb_has_changed}=0;
-  $state->{kdb_file} = $file;
-  $state->{key_file} = $key_file;
-  $state->{put_master_passwd}($master_pass);
-  $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+  # Open the newly created, saveas-ed file.
+  my $err = open_kdb($file, $key_file, $master_pass); # Sets $state->{'kdb'}
+  if (length($err)) {
+    print "Error re-opening saved file: $err\n";
+  } else {
+    print "You are now operating on file: $file\n";
+  }
+
   return 0;
 }
 
@@ -3738,7 +3897,7 @@ sub cli_close {
   }
 
   $state->{'kdb'}->clear();
-  new_kdb($state);
+  new_kdb($state); # Note, this removes the old *.lock file
   if (defined($state->{kdb_file_handle})) {
     close $state->{kdb_file_handle};
   }
@@ -4305,10 +4464,10 @@ sub cli_version($$) {
         $OS .= " ($prodname ".$osver->{'ProductVersion'}.")";
       }
     } elsif (lc($OSNAME) eq 'mswin') {
-      if (! $OPTIONAL_PM{'Win32'}->{loaded}) {
+      if (! is_loaded('Win32')) {
         runtime_load_module(\%OPTIONAL_PM,'Win32',undef);
       }
-      if ($OPTIONAL_PM{'Win32'}->{loaded}) {
+      if (is_loaded('Win32')) {
         $OS .= " (" . Win32::GetOSDisplayName() . ")";
       }
     }
@@ -4320,20 +4479,22 @@ sub cli_version($$) {
     my @modules = qw(File::KeePass Term::ShellUI Term::ReadKey Term::ReadLine);
     my @missing_modules = ();
     foreach my $module (sort keys %OPTIONAL_PM) {
-      if ($OPTIONAL_PM{$module}->{loaded}) {
+      if (is_loaded($module)) {
         push @modules, $module;
       } else {
         push @missing_modules, $module;
       }
     }
     # There are a few OS-specific modules that we'd also
-    # like to report on.
+    # like to report on. These are down-stream dependencies
+    # of %OPTIONAL_PM modules.
     my %OSspecificModules = (
-	darwin => [ qw( Mac::Pasteboard )  ],
-	mswin  => [ qw( Win32::Clipboard Win32::Console::ANSI ) ],
+	darwin  => [ qw( Mac::Pasteboard )  ],
+	mswin32 => [ qw( Win32::Clipboard ) ],
 	);
-    if (defined($OSspecificModules{lc($OSNAME)})) {
-      foreach my $module (@{$OSspecificModules{lc($OSNAME)}}) {
+    my $osname = lc($OSNAME);
+    if (defined($OSspecificModules{$osname})) {
+      foreach my $module (@{$OSspecificModules{$osname}}) {
         if (is_loaded($module)) {
           push @modules, $module;
         } else {
@@ -4361,7 +4522,7 @@ sub cli_version($$) {
     foreach my $mod_path (@loaded_modules) {
       my $mod_name = $mod_path;
       $mod_name =~ s/\.pm$//;
-      $mod_name =~ s/\Q$sep\E/::/g;
+      $mod_name =~ s%[\/]%::%g;
       # Skip modules that we've already reported on
       if (scalar(grep(/^\Q$mod_name\E$/, @modules_reported_on))) { next; }
       push @mod_names, $mod_name;
@@ -4376,18 +4537,73 @@ sub cli_version($$) {
   }
 }
 
+# Used info from https://gist.github.com/natefoo/814c5bf936922dad97ff
+# to enhance this for situations where /etc/lsb-release is missing.
+# This sub works hard to populate DISTRIB_DESCRIPTION, but nothing else.
 sub load_lsb_release {
   my $fh = new FileHandle;
-  if (-f '/etc/lsb-release' && open($fh,'<', '/etc/lsb-release')) {
-    my @lines = <$fh>;
-    close $fh;
-    my %d = ();
-    foreach my $l (@lines) {
-      chomp $l;
-      my ($k,$v) = split(/=/, $l, 2);
-      $d{$k} = $v;
+  # The first of these files that works is what we use.
+  my @release_files = qw(/etc/lsb-release /etc/os-release /usr/lib/os-release);
+  foreach my $file (@release_files) {
+    if (-f $file && open($fh,'<', $file)) {
+      my @lines = <$fh>;
+      close $fh;
+      my %d = ();
+      foreach my $l (@lines) {
+        chomp $l;
+        my ($k,$v) = split(/=/, $l, 2);
+        $d{$k} = $v;
+      }
+      # This copies PRETTY_NAME from /.../os-release into key
+      # DISTRIB_DESCRIPTION which would have been in /etc/lsb-release.
+      if (!defined($d{DISTRIB_DESCRIPTION}) && defined($d{PRETTY_NAME})) {
+        $d{DISTRIB_DESCRIPTION} = $d{PRETTY_NAME};
+      }
+      $d{data_from} = $file;
+      return \%d;
     }
-    return \%d;
+  }
+  # If we got this far, we failed to get data from an /etc/ file, and
+  # so now we'll try running lsb_release -a.
+  my $lsbr_a = lsb_release_a();
+  if (defined($lsbr_a) && defined($lsbr_a->{'Description'})) {
+    $lsbr_a->{DISTRIB_DESCRIPTION} = $lsbr_a->{Description};
+    return $lsbr_a;
+  }
+  # These may not have /etc/foo-release files or lsb_release.
+  my @version_files = qw(/etc/antix-version /etc/slackware-version);
+  foreach my $file (@version_files) {
+    if (-f $file && open($fh,'<', $file)) {
+      my @lines = <$fh>;
+      close $fh;
+      if (scalar(@lines)) {
+        my %d;
+        chomp $lines[0];
+        $d{DISTRIB_DESCRIPTION} = $lines[0];
+        $d{data_from} = $file;
+        return \%d;
+      }
+    }
+  }
+
+  return undef;
+}
+# Tries to pull Linux OS details from "lsb_release -a"
+sub lsb_release_a {
+  my @paths = split/:/, $ENV{PATH};
+  EXE_PATH: foreach my $dir (@paths) {
+    my $lsb_release = $dir.'/lsb_release';
+    if (-e -x $lsb_release) {
+      my @lines = `"$lsb_release" -a 2>/dev/null`;
+      my %d = ();
+      foreach my $l (@lines) {
+        chomp $l;
+        my ($k,$v) = split(/:\s*/, $l, 2);
+        $d{$k} = $v;
+      }
+      $d{data_from} = "$lsb_release -a";
+      return \%d;
+    }
   }
   return undef;
 }
@@ -4426,7 +4642,7 @@ sub RequestSaveOnDBChange {
 
   # If this is a newly created file we don't bother the user with
   # asking to save after every change.
-  if (! length($state->{kdb_file})) {
+  if (! (defined($state->{kdb_file}) && length($state->{kdb_file}))) {
     return -1;
   }
 
@@ -4452,7 +4668,7 @@ sub GetMasterPasswdDoubleEntryVerify {
 
   if (length($master_pass) == 0) { return ''; }
 
-  my $prompt = "Retype to verify: ";
+  my $prompt = "Please retype to verify: ";
   my $checkval = GetPassword($prompt,'*');
   chomp $checkval;
   if (recent_sigint()) { return undef; } # Bail on SIGINT
@@ -4463,7 +4679,6 @@ sub GetMasterPasswdDoubleEntryVerify {
 
   return $master_pass;
 }
-
 
 sub GetPassword {
   my $prompt = shift @_;
@@ -4521,7 +4736,7 @@ sub MyGetOpts {
   my %opts=();
   my $result = &GetOptions(\%opts, "kdb=s", "key=s", "pwfile=s", "histfile=s",
 	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s",
-	"pwsplchars=s", "xpxsecs=i");
+	"pwsplchars=s", "xpxsecs=i", "xclipsel=s");
 
   # If the user asked for help or GetOptions complained, give help and exit
   if ($opts{help} || $opts{h} || (! int($result))) {
@@ -4572,21 +4787,47 @@ sub MyGetOpts {
   $opts{'pwsplchars'} = \@special_chars;
 
   my @errs=();
-  if ((length($opts{kdb}) && (! -e $opts{kdb}))) {
+  if (defined($opts{kdb}) && length($opts{kdb}) && (! -e $opts{kdb})) {
     push @errs, "for option --kdb=<file.kbd>, the file must exist.";
   }
 
-  if ((length($opts{key}) && (! -e $opts{key}))) {
+  if (defined($opts{key}) && length($opts{key}) && (! -e $opts{key})) {
     push @errs, "for option --key=<file.key>, the file must exist.";
   }
 
-  if (length($opts{xpxsecs})) {
+  if (defined($opts{xpxsecs}) && length($opts{xpxsecs})) {
     if (! ($opts{xpxsecs} =~ m/^\d+$/)
 		|| $opts{xpxsecs} < 1 || $opts{xpxsecs} > 60 ) {
       push @errs, "--xpxsecs must be between 1 and 60.";
     }
   } else {
     $opts{xpxsecs} = 10; # Default is 10 seconds
+  }
+
+  if (defined($opts{xclipsel}) && length($opts{xclipsel})) {
+    if (is_loaded("Clipboard") && $Clipboard::driver eq 'Clipboard::Xclip') {
+      my @x11_sels = $Clipboard::driver->all_selections();
+      unshift @x11_sels, 'all';
+      if (! scalar(grep(/^$opts{xclipsel}$/, @x11_sels))) {
+        my $default = $Clipboard::driver->favorite_selection();
+        # Indicate the default by wrapping it in brackets
+        SEL: foreach my $i (0..$#x11_sels) {
+          if ($x11_sels[$i] eq $default) {
+            $x11_sels[$i] = '['.$default.']';
+            last SEL;
+          }
+        }
+        my $usemsg = "--xclipsel must be one of: ".join(", ", @x11_sels);
+        if ($opts{xclipsel} eq 'help') {
+          print $usemsg . "\n"; exit;
+        } else {
+          push @errs, $usemsg;
+        }
+      }
+    } elsif ($opts{xclipsel} eq 'help') { # help without Clipboard::Xclip
+      print "--xclipsel is only relevant on systems with X11.\n";
+      exit;
+    }
   }
 
   if (scalar(@errs)) {
@@ -4614,6 +4855,7 @@ sub GetUsageMessage {
 		'Specify the special characters used in password generation.' ],
     [ 'xpxsecs' =>
 		'Seconds to wait until clearing the clipboard for xpx.' ],
+    [ xclipsel => 'The X11 clipboard to use; "--xclipsel help" for choices.' ],
     [ help => 'This message.' ],
   );
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
@@ -4914,7 +5156,7 @@ sub get_master_passwd() {
 sub warn_if_file_changed {
   our $state;
 
-  my $file = $state->{kdb_file};
+  my $file = $state->{kdb_file} || '';
   if (! length($file)) { return 0; } # If no file was opened, don't warn
   my $file_md5 = Digest::file::digest_file_hex($file, "MD5");
   if ($state->{kdb_file_md5} ne $file_md5) {
@@ -5266,10 +5508,10 @@ sub setup_signal_handling {
 
 # 2FA-TOTP support
 sub have_otp_support() {
-  if (! $state->{OPTIONAL_PM}->{'Authen::OATH'}->{loaded}) {
+  if (! is_loaded('Authen::OATH')) {
     return(0, "Module Authen::OATH is required for OTP support.");
   }
-  if (! $state->{OPTIONAL_PM}->{'Convert::Base32'}->{loaded}) {
+  if (! is_loaded('Convert::Base32')) {
     return(0, "Module Convert::Base32 is required for OTP support.");
   }
   return(1,undef);
@@ -5304,7 +5546,7 @@ sub setup_timeout_handling {
   our $state;
   $state->{last_activity_time}=time;
   our $def_call_command = \&Term::ShellUI::call_command;
-  if ($state->{OPTIONAL_PM}->{'Sub::Install'}->{loaded}) {
+  if (is_loaded('Sub::Install')) {
     Sub::Install::reinstall_sub({
       into => "Term::ShellUI",
       as   => 'call_command',
@@ -5362,7 +5604,7 @@ sub runtime_load_module {
   }
   my $eval_result = eval("require $module;$module->import($iltxt); 1;");
   if (! defined($eval_result)) { $eval_result = 0; }
-  if ($eval_result == 1) {
+  if ($eval_result == 1 && is_loaded($module)) {
     $rOPTIONAL_PM->{$module}->{loaded} = 1;
     return 1;
   } else {
@@ -5386,6 +5628,20 @@ sub get_readline_term {
     push @rl_modules, 'Term::ReadLine::Perl';
     push @rl_modules, 'Term::ReadLine::Perl5';
   }
+  if (lc($OSNAME) =~ m/^mswin/ && (!defined($ENV{'SHELL'}))) {
+    # This supresses a diagnostics warning if/when Term::ReadLine::Perl5
+    # is imported below. It tries to run '$SHELL -c "some command"' which
+    # fails on windows and shows error output. The rem command will take
+    # anything and return nothing, so it silences that warning.
+    $ENV{'SHELL'}='rem';
+  }
+  # On mswin, starting with v3.5, we use Term::Size::Win32 to set the
+  # COLUMNS and LINES env vars so that Term::ReadLine::Perl will stop
+  # complaining about "Unable to get Terminal Size."
+  if (lc($OSNAME) =~ m/^mswin/ && is_loaded('Term::Size::Win32') &&
+	(! (defined($ENV{'COLUMNS'}) && defined($ENV{'LINES'})))) {
+    ($ENV{'COLUMNS'}, $ENV{'LINES'}) = Term::Size::Win32::chars();
+  }
   my $rl_term = undef;
   my $hold_TERM=undef;
   MODULE: foreach my $module (@rl_modules) {
@@ -5393,8 +5649,8 @@ sub get_readline_term {
     # pretty good terminals but they behave badly if the environment
     # variable TERM=dumb, and so we override that here if needed.
     if (lc($OSNAME) =~ m/^mswin/ && $module =~ m/^Term::ReadLine::Perl5?/ &&
-						$ENV{'TERM'} eq 'dumb') {
-      $hold_TERM=$ENV{'TERM'};
+			((!defined($ENV{'TERM'})) || $ENV{'TERM'} eq 'dumb')) {
+      $hold_TERM=$ENV{'TERM'} || '';
       $ENV{'TERM'} = 'vt102';
     }
     if (runtime_load_module($rOPTIONAL_PM,$module,undef) eq 1) {
@@ -5423,7 +5679,7 @@ sub get_readline_term {
   }
 
   # I don't like readline ornaments in kpcli
-  if (lc($OSNAME) =~ m/^mswin/ && $rOPTIONAL_PM->{'Capture::Tiny'}->{loaded}) {
+  if (lc($OSNAME) =~ m/^mswin/ && is_loaded('Capture::Tiny')) {
     # On MS Windows, the RLTERM->ornaments() call causes a warning about
     # not having a termcap file. It seems hamless and so we suppress that
     # message if we have Capture::Tiny available.
@@ -5464,13 +5720,13 @@ sub get_readline_term {
   # 2) We use readline() in places like cli_new, cli_edit, etc. and
   #    we do not want all those inputs in the history file (cruft).
   if ($rl_term->ReadLine eq 'Term::ReadLine::Perl') {
-    no strict 'refs';
-    no warnings 'once'; # This is intentionally only used once
+    no warnings 'once';     # This is intentionally only used once
+    no warnings 'redefine'; # This subrouting is intentionally redefined
     *readline::add_line_to_history = sub { return undef; };
   }
   if ($rl_term->ReadLine eq 'Term::ReadLine::Perl5') {
-    no strict 'refs';
-    no warnings 'once'; # This is intentionally only used once
+    no warnings 'once';     # This is intentionally only used once
+    no warnings 'redefine'; # This subrouting is intentionally redefined
     *Term::ReadLine::Perl5::readline::add_line_to_history = sub {return undef;}
   }
 
@@ -5612,6 +5868,10 @@ ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
 for the kpcli port to Windows and, using cpanminus, one can install all
 of kpcli's dependencies, sans Term::ReadLine::Gnu which is optional for
 kpcli and not supported on MS Windows.
+
+Since version v3.5, kpcli supports using modules installed in one's
+home directory (under ~/perl5), on Unix-like systems. Without root
+authority, tools like cpanm will install to ~/perl5/ by default.
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
@@ -5898,8 +6158,36 @@ this program would not have been practical for me to author.
                      and with it the otp and xo commands.
                   - Added --xpxsecs option, as requested in
                      SourceForge feature request #20.
+ 2020-Sep-19 v3.5 - Added --xclipsel option, in response to
+                     SourceForge bug #42.
+                  - Fixed inability to change fields back to empty,
+                     in response to SourceForge bug #43. The problem
+                     still exists for Password and Notes, but a good
+                     fix for those eludes me.
+                  - Support for using perl modules installed in one's
+                     home directory (~/perl5) on Unix-like systems.
+                  - Added KeePass v2 (*.kdbx) support to export.
+                  - The show command now redacts 2FA keys in Comments
+                     unless both -a and -f are specified.
+                  - Fixed an issue in cli_saveas() where the *.lock
+                     file from the saveas source file was stranded.
+                     Also fixed not properly switching to v2 behavior
+                     when saveas-ing a v1 file to v2 (*.kdb to *.kdbx).
+                  - Enhanced load_lsb_release() so that it will work
+                     on more Linux operating systems.
+                  - Fixed a couple of "vers -v" bugs on mswin32.
+                  - Fixed a couple of bugs in the stats command.
+                  - Minor, non-functional changes to prevent warnings
+                     in new_edit_single_line_input() and cli_pwck().
+                  - Replaced checks of $OPTIONAL_PM{<foo>}->{loaded}
+                     with simpler calls to is_loaded(<foo>).
+                  - Added several defined() tests that "use diagnostics"
+                     pointed out on an older perl that I used (v5.10.1).
 
 =head1 TODO ITEMS
+
+  Consider adding support for setting the Expires date/time on entries
+  when creating or editing them.
 
   Consider adding support for TOTP with different digest algorithms
   than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
@@ -5912,8 +6200,6 @@ this program would not have been practical for me to author.
     2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
   This code may prove useful if I decide to not use Authen::OATH:
   https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
-
-  Consider broadening shell_expansion support beyond just mv and ls.
 
   Consider adding a tags command for use with v2 files.
    - To navigate by entry tags
@@ -5931,16 +6217,18 @@ this program would not have been practical for me to author.
 
 =pod OSNAMES
 
-Unix-like
- - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
- - As of version 3.0, development is done on Linux Mint 17.
- - Known to work on many other Linux and *BSD distributions, and
-   kpcli is packaged with many distributions now-a-days.
- - Known to work on macOS and is packaged in Homebrew (brew.sh).
+=head2 Unix-like
+   - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
+   - As of version 3.5, development is done on Linux Mint 18.3.
+   - Known to work on many other Linux and *BSD distributions, and
+     kpcli is packaged with many distributions now-a-days.
+   - Known to work on macOS and is packaged in Homebrew (brew.sh).
+   - Will use modules installed under ~/perl5/. When not given root
+     permission, tools like cpanm install to ~/perl5/ by default.
 
-Microsoft Windows
- - As of v2.4, Microsoft Windows is also supported.
- - Tested and compiled on Strawberry Perl 5.16.2 on Windows 10.
+=head2 Microsoft Windows
+   - As of v2.4, Microsoft Windows is also supported.
+   - As of v3.5, compiled on Strawberry Perl 5.32.0.1 on Windows 10.
 
 =pod SCRIPT CATEGORIES
 

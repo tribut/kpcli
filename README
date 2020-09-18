@@ -1,4 +1,4 @@
-KPCLI-3.4(1)          User Contributed Perl Documentation         KPCLI-3.4(1)
+KPCLI-3.5(1)          User Contributed Perl Documentation         KPCLI-3.5(1)
 
 
 
@@ -74,6 +74,10 @@ PREREQUISITES
        for the kpcli port to Windows and, using cpanminus, one can install all
        of kpcli's dependencies, sans Term::ReadLine::Gnu which is optional for
        kpcli and not supported on MS Windows.
+
+       Since version v3.5, kpcli supports using modules installed in one's
+       home directory (under ~/perl5), on Unix-like systems. Without root
+       authority, tools like cpanm will install to ~/perl5/ by default.
 
 CAVEATS AND WORDS OF CAUTION
        The main author of kpcli primarily interoperability tests with KeePassX
@@ -352,8 +356,36 @@ CHANGELOG
                             and with it the otp and xo commands.
                          - Added --xpxsecs option, as requested in
                             SourceForge feature request #20.
+        2020-Sep-19 v3.5 - Added --xclipsel option, in response to
+                            SourceForge bug #42.
+                         - Fixed inability to change fields back to empty,
+                            in response to SourceForge bug #43. The problem
+                            still exists for Password and Notes, but a good
+                            fix for those eludes me.
+                         - Support for using perl modules installed in one's
+                            home directory (~/perl5) on Unix-like systems.
+                         - Added KeePass v2 (*.kdbx) support to export.
+                         - The show command now redacts 2FA keys in Comments
+                            unless both -a and -f are specified.
+                         - Fixed an issue in cli_saveas() where the *.lock
+                            file from the saveas source file was stranded.
+                            Also fixed not properly switching to v2 behavior
+                            when saveas-ing a v1 file to v2 (*.kdb to *.kdbx).
+                         - Enhanced load_lsb_release() so that it will work
+                            on more Linux operating systems.
+                         - Fixed a couple of "vers -v" bugs on mswin32.
+                         - Fixed a couple of bugs in the stats command.
+                         - Minor, non-functional changes to prevent warnings
+                            in new_edit_single_line_input() and cli_pwck().
+                         - Replaced checks of $OPTIONAL_PM{<foo>}->{loaded}
+                            with simpler calls to is_loaded(<foo>).
+                         - Added several defined() tests that "use diagnostics"
+                            pointed out on an older perl that I used (v5.10.1).
 
 TODO ITEMS
+         Consider adding support for setting the Expires date/time on entries
+         when creating or editing them.
+
          Consider adding support for TOTP with different digest algorithms
          than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
          the TOTP time to be something other than 30 seconds and the length
@@ -365,8 +397,6 @@ TODO ITEMS
            2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
          This code may prove useful if I decide to not use Authen::OATH:
          https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
-
-         Consider broadening shell_expansion support beyond just mv and ls.
 
          Consider adding a tags command for use with v2 files.
           - To navigate by entry tags
@@ -381,19 +411,17 @@ TODO ITEMS
          older than a user supplied time.
 
 OPERATING SYSTEMS AND SCRIPT CATEGORIZATION
-       Unix-like
-        - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
-        - As of version 3.0, development is done on Linux Mint 17.
-        - Known to work on many other Linux and *BSD distributions, and
-          kpcli is packaged with many distributions now-a-days.
-        - Known to work on macOS and is packaged in Homebrew (brew.sh).
-
-       Microsoft Windows
-        - As of v2.4, Microsoft Windows is also supported.
-        - Tested and compiled on Strawberry Perl 5.16.2 on Windows 10.
-
+   Unix-like - Originally written and tested on Ubuntu Linux 10.04.1 LTS. - As
+       of version 3.5, development is done on Linux Mint 18.3. - Known to work
+       on many other Linux and *BSD distributions, and kpcli is packaged with
+       many distributions now-a-days. - Known to work on macOS and is packaged
+       in Homebrew (brew.sh). - Will use modules installed under ~/perl5/.
+       When not given root permission, tools like cpanm install to ~/perl5/ by
+       default.
+   Microsoft Windows - As of v2.4, Microsoft Windows is also supported. - As
+       of v3.5, compiled on Strawberry Perl 5.32.0.1 on Windows 10.
        "UNIX/System_administration", "Win32/Utilities"
 
 
 
-perl v5.18.2                      2020-04-25                      KPCLI-3.4(1)
+perl v5.22.1                      2020-09-19                      KPCLI-3.5(1)
