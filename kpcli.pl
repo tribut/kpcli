@@ -13,6 +13,9 @@
 # phone and switching to KeePass, so that I could access my password
 # database on my phone. This program scratches that itch.
 #
+# Reference information on the KeePass file format:
+# https://gist.github.com/lgg/e6ccc6e212d18dd2ecd8a8c116fb1e45
+#
 ###########################################################################
 
 ########################
@@ -174,9 +177,9 @@ $|=1; # flush immediately after writes or prints to STDOUT
 
 my $DEBUG=0;
 $Data::Dumper::Useqq = 1;    # Have Dumper escape special chars (like \0)
-my $DEFAULT_PASSWD_LEN = 20; # Default length of generated passwords.
-my $DEFAULT_PASSWD_MIN = 1;  # Minimum length of generated passwords.
-my $DEFAULT_PASSWD_MAX = 50; # Maximum length of generated passwords.
+our $DEFAULT_PASSWD_LEN = 20;# Default length of generated passwords.
+our $DEFAULT_PASSWD_MIN = 1; # Minimum length of generated passwords.
+our $DEFAULT_PASSWD_MAX = 50;# Maximum length of generated passwords.
 my $DEFAULT_ENTRY_ICON = 0;  # In keepassx, icon 0 is a golden key
 my $DEfAULT_GROUP_ICON = 49; # In keepassx, icon 49 is an opened file folder
 my $DEfAULT_BAKUP_ICON = 2;  # In keepassx, icon 2 is a warning sign
@@ -186,9 +189,10 @@ my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.5";
+my $VERSION = "3.6";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
+our $PASSWD_ECHO_CHAR = '*';
 my $opts = MyGetOpts(); # Will only return with options we think we can use
 
 my $doc_passwd_gen =
@@ -553,6 +557,11 @@ my $term = new Term::ShellUI(
              minargs => 0, maxargs => 0, args => "",
              method => sub { run_no_TSTP(\&cli_save, @_); },
          },
+         "passwd" => {
+             desc => "Change the opened database's password",
+             minargs => 0, maxargs => 0, args => "",
+             method => sub { run_no_TSTP(\&cli_passwd, @_); },
+         },
          "close" => {
              desc => "Close the currently opened database",
              minargs => 0, maxargs => 0, args => "",
@@ -586,7 +595,7 @@ my $term = new Term::ShellUI(
 
          "pwd" => {
              desc => "Print the current working directory",
-             maxargs => 0, proc => \&cli_pwd,
+             maxargs => 0, method => \&cli_pwd,
          },
          "icons" => {
              desc => "Change group or entry icons in the database",
@@ -596,6 +605,28 @@ my $term = new Term::ShellUI(
        },
     );
 $term->prompt(\&term_set_prompt);
+
+# This allows the installing of code into any/all command methods.
+# It is used here to insert PrintSupportMessage() into all commands.
+my $commands = $term->commands();
+CMD: foreach my $cmd (sort keys %{$commands}) {
+  METHOD: foreach my $proc_or_meth (qw(proc method)) {
+    my $method = $commands->{$cmd}->{$proc_or_meth};
+    #print "LHHD: $cmd $proc_or_meth ref: " . ref($method) . "\n";
+    if (ref($method) ne 'CODE') { next METHOD; } # Only alter CODE
+    if ($cmd eq 'quit') {
+      next CMD; # We handle PrintSupportMessage() inside of cli_quit()
+    }
+    # If we're operating in --command mode, don't insert messages
+    # requesting support so as to not complicate expect scripts.
+    if (! defined($opts->{command})) { last CMD; }
+    # If we get this far, insert the PrintSupportMessage() code
+    my $new_code = sub { my $rv=&$method(@_); PrintSupportMessage(); $rv; };
+    $commands->{$cmd}->{$proc_or_meth} = $new_code;
+  }
+}
+$term->commands($commands);
+#die Dumper($commands) . "\n";
 
 # Seed our state global variable
 our $state={
@@ -655,11 +686,13 @@ if (defined($opts->{timeout}) && int($opts->{timeout}) > 0) {
   setup_timeout_handling();
 }
 
-if ( defined($opts->{command}) ) {
-    $term->process_a_cmd($opts->{command});
-    &cli_quit($term,undef); # Needed else we leave a foo.lock file behind
+if ( defined($opts->{command}) && ref($opts->{command}) eq 'ARRAY') {
+  foreach my $cmd (@{$opts->{command}}) {
+    $term->process_a_cmd($cmd);
+  }
+  &cli_quit($term,undef); # Needed else we leave a foo.lock file behind
 } else {
-    $term->run();
+  $term->run();
 }
 
 exit;
@@ -715,9 +748,28 @@ sub open_kdb {
   }
   if (recent_sigint()) { return undef; } # Bail on SIGINT
   $state->{kdb} = File::KeePass->new;
-  if (! eval { $state->{kdb}->load_db($file,
+
+  # With v3.6, we started doing extended error catching and reporting here.
+  # KeePass has added new features to the kdbx v2 file format that are
+  # referred to as "KDBX 4" and File::KeePass cannot open those files.
+  # https://keepass.info/help/kb/kdbx_4.html
+  # https://bugzilla.redhat.com/show_bug.cgi?id=1820134
+  my @load_db_warns;
+  if (! eval { local $SIG{__WARN__} = sub { push @load_db_warns, @_; };
+		$state->{kdb}->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
-    return "Couldn't load the file $file\nError(s) from File::KeePass:\n$@";
+    my $errmsg = "Couldn't load the file $file\n\n" .
+		"Error(s) from File::KeePass:\n$@";
+    if (scalar(@load_db_warns)) {
+      $errmsg .= "\nWarning(s) from File::KeePass:\n";
+      my @warns = map { 
+		my $t = $_;
+		$t =~ s/[^[:print:]]+//g;
+		$t =~ s/(Found an unknown header type) \((\d+).+$/$1: $2/;
+		$t; } @load_db_warns;
+      $errmsg .= " - " . join("\n - ", @warns) . "\n";
+    }
+    return $errmsg;
   }
 
   if (defined($state->{placed_lock_file})) {
@@ -1251,6 +1303,10 @@ sub cli_cd {
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   my $raw_pathstr = $params->{args}->[0];
+  # "cd" -- no parameter is given, so go to "home" (/)
+  if (! defined($raw_pathstr)) {
+    return cli_cd($self, {'args' => ['/']});;
+  }
   # "cd ."
   if ($raw_pathstr =~ m/^[.]$/) {
     return; # nothing to do
@@ -1673,6 +1729,9 @@ sub cli_find($) {
     my $key=get_single_key();
     print "\n";
     if (lc($key) eq 'y') {
+      # We first cli_ls() so that things like xN work on the entry
+      cli_ls($self,{"args" => ["/$FOUND_DIR/"]});
+      # Now show the entry
       my $search_params = { 'group_id =' => $found_gid };
       my ($e,@empty) = $k->find_entries($search_params);
       my $full_path="/$FOUND_DIR/" . $e->{title};
@@ -2886,7 +2945,7 @@ sub new_edit_single_line_input($$) {
         die "BUG: it should be impossible to get to this code!\n";
       }
     } elsif (length($val) && $input->{double_entry_verify}) {
-      my $prompt = "Please retype to verify: ";
+      my $prompt = "Retype to verify: ";
       my $checkval = '';
       if ($input->{hide_entry}) {
         $checkval = GetPassword($prompt, '');
@@ -3443,6 +3502,44 @@ sub cli_import_keepass {
   refresh_state_all_paths();
   $state->{kdb_has_changed}=1;
   RequestSaveOnDBChange();
+}
+
+sub cli_passwd() {
+  our $state;
+
+  # We don't allow passwd on newly-created, unsaved databases
+  if (! defined($state->{kdb_file})) {
+    print "Please use saveas to save newly created databases.\n";
+    return -1;
+  }
+
+  print "Changing password for ".$state->{kdb_file}."\n";
+
+  # Ask for the current password if it exists
+  if (defined($state->{master_pass})) {
+    my $test_passwd = GetMasterPasswd("The current password: ");
+    my $curr_passwd = $state->{get_master_passwd}();
+    if ($test_passwd ne $curr_passwd) {
+      print "Incorrect password.\n";
+      return -1;
+    }
+  }
+
+  # Get the new password from the user with double entry verification
+  my $master_pass=GetMasterPasswdDoubleEntryVerify("The new password: ");
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+  if (! defined($master_pass)) { return undef; }
+
+  # Set the new password and the kdb_has_changed flag, then ask the
+  # user if they want to save the database now.
+  $state->{put_master_passwd}($master_pass);
+  $state->{kdb_has_changed}=1;
+  print "Password changed but file not saved. Save it now? [y/N]";
+  my $key=get_single_key();
+  print "\n";
+  if (lc($key) ne 'y') { return 0; }
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+  return cli_save(undef);
 }
 
 sub cli_export($$) {
@@ -4064,10 +4161,11 @@ sub get_human_entry_list {
 # Routine to hook into Term::ShellUI's exit on Ctrl-D functionality
 sub eof_exit_hook {
   our $state;
-  # We need a newline if cli_quit() will talk tothe user about saving
+  # We need a newline if cli_quit() will ask the user about saving
   if ($state->{kdb_has_changed}) { print "\n"; }
   # cli_quit() will handle user interaction and return a value for
   # the exit_hook of Term::ShellUI.
+  $state->{in_eof_exit_hook} = 1;
   return cli_quit($state->{term},undef);
 }
 
@@ -4360,6 +4458,12 @@ sub cli_quit($$) {
   my $params = shift @_;
   our $state;
 
+  my $in_eof_exit_hook = 0;
+  if (defined($state->{in_eof_exit_hook})) {
+    $in_eof_exit_hook = $state->{in_eof_exit_hook};
+    $state->{in_eof_exit_hook} = 0; # Reset the state
+  }
+
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   if ($state->{kdb_has_changed}) {
@@ -4377,6 +4481,10 @@ sub cli_quit($$) {
   }
   delete($state->{placed_lock_file});
   $self->exit_requested(1);
+  if ($in_eof_exit_hook) {
+    print "\n"; # We need an prepended new-line when ^D was used to exit
+  }
+  PrintSupportMessage(1);
   return 0; # It's OK to quit
 }
 
@@ -4658,18 +4766,19 @@ sub RequestSaveOnDBChange {
 }
 
 sub GetMasterPasswd {
-  my $prompt = "Please provide the master password: ";
-  return GetPassword($prompt,'*');
+  my $prompt = shift @_ || "Provide the master password: ";
+  return GetPassword($prompt,$PASSWD_ECHO_CHAR);
 }
 
 sub GetMasterPasswdDoubleEntryVerify {
-  my $master_pass=GetMasterPasswd();
+  my $prompt = shift @_ || undef;
+  my $master_pass=GetMasterPasswd($prompt);
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
   if (length($master_pass) == 0) { return ''; }
 
-  my $prompt = "Please retype to verify: ";
-  my $checkval = GetPassword($prompt,'*');
+  $prompt = "Retype to verify: ";
+  my $checkval = GetPassword($prompt,$PASSWD_ECHO_CHAR);
   chomp $checkval;
   if (recent_sigint()) { return undef; } # Bail on SIGINT
   if ($master_pass ne $checkval) {
@@ -4734,13 +4843,31 @@ sub GetPassword {
 
 sub MyGetOpts {
   my %opts=();
-  my $result = &GetOptions(\%opts, "kdb=s", "key=s", "pwfile=s", "histfile=s",
-	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s",
-	"pwsplchars=s", "xpxsecs=i", "xclipsel=s");
+  my @params = (
+	"kdb=s", "key=s", "pwfile=s", "histfile=s",
+	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s@",
+	"nopwstars", "pwsplchars=s", "xpxsecs=i", "xclipsel=s",
+	"pwwords=s", "pwlen=i", "pwscmin=i", "pwscmax=i");
+  my $result = &GetOptions(\%opts, @params);
 
-  # If the user asked for help or GetOptions complained, give help and exit
-  if ($opts{help} || $opts{h} || (! int($result))) {
+  my $use_help_msg = "Use --help to see information on command line options.";
+
+  # Set any undefined booleans to 0
+  foreach my $param (@params) {
+    if ($param !~ m/=/ && (! defined($opts{$param}))) {
+      $opts{$param} = 0; # Booleans
+    }
+  }
+
+  # If the user asked for help give it and exit
+  if ($opts{help} || $opts{h}) {
     print GetUsageMessage();
+    exit;
+  }
+
+  # If GetOptions failed it told the user why, so let's exit.
+  if (! int($result)) {
+    print "\n" . $use_help_msg . "\n";
     exit;
   }
 
@@ -4753,6 +4880,11 @@ sub MyGetOpts {
     } else {
       our $HISTORY_FILE = "~/.$APP_NAME-history";
     }
+  }
+
+  # If the user asked for --nopwstars, clear the $PASSWD_ECHO_CHAR
+  if ($opts{nopwstars}) {
+    our $PASSWD_ECHO_CHAR = '';
   }
 
   # Sanity check the use of --pwsplchars
@@ -4804,6 +4936,29 @@ sub MyGetOpts {
     $opts{xpxsecs} = 10; # Default is 10 seconds
   }
 
+  if (defined($opts{pwwords}) && length($opts{pwwords}) &&
+						(! -e $opts{pwwords})) {
+    push @errs, "for option --pwwords=<file>, the file must exist.";
+  }
+
+  if (defined($opts{pwlen})) {
+    if ($opts{pwlen} < 1) {
+      push @errs, "--pwlen of less than 1 is nonsensical.";
+    }
+    our ($DEFAULT_PASSWD_LEN, $DEFAULT_PASSWD_MAX);
+    $DEFAULT_PASSWD_LEN = $opts{pwlen};
+    if ($DEFAULT_PASSWD_LEN > $DEFAULT_PASSWD_MAX) {
+      $DEFAULT_PASSWD_MAX = $DEFAULT_PASSWD_LEN;
+    }
+  }
+
+  # Set defaults for --pwscmin=i and --pwscmax=i
+  if (! defined($opts{pwscmin})) { $opts{pwscmin} = 1; }
+  if (! defined($opts{pwscmax})) { $opts{pwscmax} = 9999; }
+  if ($opts{pwscmax} < $opts{pwscmin}) {
+    push @errs, "--pwscmax cannot exceed --pwscmin, which defaults to 1.";
+  }
+
   if (defined($opts{xclipsel}) && length($opts{xclipsel})) {
     if (is_loaded("Clipboard") && $Clipboard::driver eq 'Clipboard::Xclip') {
       my @x11_sels = $Clipboard::driver->all_selections();
@@ -4833,35 +4988,66 @@ sub MyGetOpts {
   if (scalar(@errs)) {
     warn "There were errors:\n" .
 	"  " . join("\n  ", @errs) . "\n\n";
-    print &GetUsageMessage();
+    print $use_help_msg . "\n";
     exit;
   }
 
   return \%opts;
 }
 
+sub PrintSupportMessage {
+  my $frequency = shift @_ || 20; # Every twentieth command by default
+
+  my $t = color('yellow') .
+	"Please consider supporting kpcli development by sponsoring its " . 
+	"author:\nhttps://github.com/sponsors/hightowe" . color('clear');
+
+  # We need to keep count of how often we're called (command count)
+  our $state;
+  if (! defined($state->{support_msg_cmd_count})) {
+    $state->{support_msg_cmd_count} = 0;
+  }
+  $state->{support_msg_cmd_count}++;
+
+  # Show the message every Nth command run, based on $frequency
+  if ( ($state->{support_msg_cmd_count} % $frequency) == 0) {
+    print $t . "\n";
+  }
+  # Note that we are intentionally *not* returning anything here!!!
+}
+
 sub GetUsageMessage {
+  my $parmlen = 14;
+  my $col1len = $parmlen + 3;
+  my $pwlen = our $DEFAULT_PASSWD_LEN;
   my @params = (
-    [ kdb => 'Optional KeePass database file to open (must exist).' ],
-    [ key => 'Optional KeePass key file (must exist).' ],
-    [ pwfile => 'Read master password from file instead of console.' ],
-    [ histfile => 'Specify your history file (or perhaps /dev/null).' ],
-    [ readonly => 'Run in read-only mode; no changes will be allowed.' ],
-    [ "timeout=i" => 'Lock interface after i seconds of inactivity.' ],
-    [ command => 'Run single command and exit (no interactive session).' ],
+    [ 'kdb=s'      => 'Optional KeePass database file to open (must exist).' ],
+    [ 'key=s'      => 'Optional KeePass key file (must exist).' ],
+    [ 'pwfile=s'   => 'Read master password from file instead of console.' ],
+    [ 'histfile=s' => 'Specify your history file (or perhaps /dev/null).' ],
+    [ readonly     => 'Run in read-only mode; no changes will be allowed.' ],
+    [ "timeout=i"  => 'Lock interface after i seconds of inactivity.' ],
+    [ 'command=s'  => "Run a command and exit (no interactive session).\n" .
+                      ' 'x$col1len .
+                      "Multiple --command parameters can be used." ],
     [ 'no-recycle' =>
 		'Don\'t store entry changes in /Backup or "/Recycle Bin".' ],
-    [ 'pwsplchars' =>
-		'Specify the special characters used in password generation.' ],
-    [ 'xpxsecs' =>
+    [ 'pwwords=s'  => "File of words for building word-based passwords." ],
+    [ 'pwsplchars=s' => 'The special characters used in password generation.' ],
+    [ 'pwlen=i'    => "Length of generated passwords (default is $pwlen)." ],
+    [ 'pwscmin=i'  => "Min number of special chars in generated passwords." ],
+    [ 'pwscmax=i'  => "Max number of special chars in generated passwords." ],
+    [ 'nopwstars'  => "Don't show star characters (*) for password input." ],
+    [ 'xpxsecs=i'  =>
 		'Seconds to wait until clearing the clipboard for xpx.' ],
-    [ xclipsel => 'The X11 clipboard to use; "--xclipsel help" for choices.' ],
-    [ help => 'This message.' ],
+    [ 'xclipsel=s' => 'X11 clipboard to use; "--xclipsel help" for choices.' ],
+    [ help         => 'This message.' ],
   );
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
   "\n";
   foreach my $param (@params) {
-    $t .= sprintf("  %-13s %s\n", '--'.$param->[0], $param->[1]);
+    my $fmt = '  %-'.$parmlen.'s %s';
+    $t .= sprintf("$fmt\n", '--'.$param->[0], $param->[1]);
   }
   $t .= "\n" .
   "Run kpcli with no options and type 'help' at its command prompt to learn\n" .
@@ -5206,20 +5392,67 @@ sub generatePassword {
 
 sub generatePasswordGobbledygook {
   my $length = shift;
+
+  # Build the charsets that we pull from
   my @special_chars=@{$opts->{'pwsplchars'}};
   my @normal_chars=('a'..'z','A'..'Z',0..9);
-  my $charset = join('', (@normal_chars,@special_chars));
+  my $nc_charset = join('', @normal_chars);
+  my $sc_charset = join('', @special_chars);
+  my $charset = $nc_charset . $sc_charset;
+
   # Generate the password
   my $password = '';
   while (length($password) < $length) {
     $password .= substr($charset, (int(rand(length($charset)))), 1);
   }
-  # Make sure that at least one special character appears
-  my $sccc=join('', @special_chars);
-  if ($password !~ m/[\Q$sccc\E]/) {
-    my $sc=$special_chars[int(rand(length($sccc)))];
-    substr($password,int(rand(length($password))), 1, $sc);
-  }
+
+  # Now we need to potentially modify the password to conform
+  # with the --pwscmin and --pwscmax requirements. We do that
+  # by making random substitutions of normal characters for
+  # special characters or vice-versa.
+  my $scmin = $opts->{pwscmin};
+  my $scmax = $opts->{pwscmax};
+  my $sccount = () = $password =~ m/[\Q$sc_charset\E]{1}/gi;
+  SC_RANGE: until ($sccount >= $scmin && $sccount <= $scmax) {
+    # Build %sc_locs and %nc_locs hashes, keyed on the
+    # position of each character within $password.
+    my %sc_locs = ();
+    my %nc_locs = ();
+    foreach my $i (0..(length($password)-1)) {
+      my $char = substr($password, $i, 1);
+      if ($char =~ m/^[\Q$sc_charset\E]$/) {
+        $sc_locs{$i} = $char;
+      } else {
+        $nc_locs{$i} = $char;
+      }
+    }
+    my $sccount = scalar(keys(%sc_locs)); # sc count in $password
+    my $nccount = scalar(keys(%nc_locs)); # nc count in $password
+    #print "LHHD: sccount=$sccount, nccount=$nccount, $password\n";
+    #die "LHHD:\n" . Dumper(\%sc_locs, \%nc_locs) . "\n";
+    if ($sccount > $scmax && $sccount > 0) { # remove a special character
+      # Randomly choose a special char to replace with a normal char
+      my $pos = (keys %sc_locs)[int(rand($sccount))];
+      my $newchar = substr($nc_charset, (int(rand(length($nc_charset)))), 1);
+      substr $password, $pos, 1, $newchar;
+    } elsif ($sccount < $scmin && $nccount > 0) { # add a special character
+      # Randomly choose a normal char to replace with a special char
+      my $pos = (keys %nc_locs)[int(rand($nccount))];
+      my $newchar = substr($sc_charset, (int(rand(length($sc_charset)))), 1);
+      substr $password, $pos, 1, $newchar;
+    } else {
+      last SC_RANGE;
+    }
+    #print "  $password\n";
+
+    # If the user asked for more special characters than the
+    # entire password length, then we did our best by providing
+    # nothing but special characters and so we stop here.
+    if ($nccount < 1 && $scmin > length($password)) {
+      last SC_RANGE;
+    }
+  };
+
   return $password
 }
 
@@ -5335,7 +5568,12 @@ sub generatePasswordFromDict($) {
   my $be_silent = shift @_ || 0;
   my @words=();
   my $fh = new FileHandle;
-  my @dict_files = qw(/usr/share/dict/words /usr/dict/words);
+  my @dict_files = qw(
+		/etc/dictionaries-common/words
+		/usr/share/dict/words /usr/dict/words);
+  if (defined($opts->{pwwords}) && length($opts->{pwwords})) {
+    @dict_files = $opts->{pwwords};
+  }
   DICTS: foreach my $dictfile (@dict_files) {
     if (-f $dictfile && -r $dictfile && open($fh,'<', $dictfile)) {
       @words = <$fh>;
@@ -5348,27 +5586,33 @@ sub generatePasswordFromDict($) {
       print color('yellow') .
 	"No adequate dictionary found to generate a words-based password.\n".
 	"These locations were checked:\n - ".join("\n - ", @dict_files)."\n" .
+	"Perhaps download one from https://github.com/dwyl/english-words\n" .
+	"and use the --pwwords flag.\n" .
 	color('clear');
     }
     return undef;
   }
-  my $length_tries = 12;
+  my $length_tries = $DEFAULT_PASSWD_LEN * 2; # Scale with --pwlen
   my $password='';
+  my @passwords = ();
   do {
-    my @passwords = ();
-    my $word_tries=20;
-    while (scalar(@passwords) < 4 && $word_tries-- > 0) {
+    my $word_tries=10;
+    WORD: while ($word_tries-- > 0) {
       my $word = $words[int(rand(scalar(@words)))];
       chomp $word;
       $word =~ s/[^a-zA-Z0-9]//g;
-      if (length($word) > 7) { next; } # Don't care for big words
+      # print "LHHD: word: $word\n";
+      if (length($word) < 3) { next; } # Don't want small words
+      if (length($word) > 8) { next; } # Don't want big words
       push @passwords, $word;
+      last WORD; # We added a word so move on...
     }
-    if (scalar(@passwords) == 4) {
-      $password=join('.', @passwords);
+    my $pwtmp=join('.', @passwords);
+    # warn "LHHD: $pwtmp\n";
+    # If we have 4 or more words and adequate length then we can exit
+    if (scalar(@passwords) >= 4 && length($pwtmp) >= $DEFAULT_PASSWD_LEN) {
+      $password=join('.', @passwords); # Assigning this exists the do loop
     }
-    #warn "LHHD: $password\n";
-    if (length($password) < 27) { $password=''; } # Need a decent overall size
   } until (length($password) || $length_tries-- < 0);
 
   return $password;
@@ -5811,67 +6055,9 @@ Please run the program and type "help" to learn how to use it.
 Run the program with --help as a command line option to learn about
 its command line options.
 
-=head1 PREREQUISITES
+=head1 INSTALLATION
 
-This program requires these non-core modules:
-
-C<Crypt::Rijndael> - libcrypt-rijndael-perl on Ubuntu 10.04
-
-C<Term::ReadKey>   - libterm-readkey-perl on Ubuntu 10.04
-
-C<Sort::Naturally> - libsort-naturally-perl on Ubuntu 10.04
-
-C<File::KeePass>   - libfile-keepass-perl on Ubuntu 12.04
-
-C<Term::ShellUI>   - libterm-shellui-perl on Ubuntu 12.10
-
-It is recommended that you install C<Term::ReadLine::Gnu> which will
-provide more fluid signal handling on Unix-like systems, making kpcli
-robust to suspend, resume, and interrupt - SIGSTP, SIGCONT and SIGINT.
-That module is in the libterm-readline-gnu-perl package on Ubuntu.
-
-You can optionally install C<Term::ReadLine::Perl5>, which is often
-preferred on platforms without GNU readline (MacOS, Windows, etc.)
-
-You can optionally install C<Clipboard> and C<Tiny::Capture> to use the
-clipboard features; https://metacpan.org/pod/Clipboard and
-libcapture-tiny-perl on Ubuntu 10.04.
-
-You can optionally install C<Sub::Install> to use the --timeout feature.
-
-You can optionally install C<Data::Password> to use the pwck feature
-(Password Quality Check); libdata-password-perl on Ubuntu 10.04.
-
-You can optionally install C<Data::Password::passwdqc>, which is preferred
-by the pwck feature if it is available. That module is not commonly
-packaged and its list of dependencies is quite long, but cpanminus installs
-it nicely on Linux Mint. It appeared that all of its upstream dependencies
-were packaged in Linux Mint and so I apt-get install'ed them first, and
-then cpanminus only installed C<Data::Password::passwdqc>. Because it is a
-binding to a C library, C<Data::Password::passwdqc> is much faster than
-C<Data::Password> and also seems to have a bit more stict password rules.
-
-You can optionally install C<Crypt::PWSafe3> in order to import
-Password Safe v3 files (https://pwsafe.org/). The dependency list
-of this module is hefty and it is not packaged in many distros, but
-cpanminus installs it nicely on Linux Mint (https://cpanmin.us/).
-
-You can optionally install C<Math::Random::ISAAC> in order to use a
-more secure rand() function. Package libmath-random-isaac-perl on Debian.
-
-You can optionally install C<Authen::OATH> and C<Convert::Base32> to use
-the TOTP one time password functionality (RFC 6238).  Those are packages
-libauthen-oath-perl and libconvert-base32-perl on Debian.
-
-On MS Windows, you can optionally install C<Win32::Console::ANSI> to get
-ANSI colors in Windows cmd terminals. Strawberry Perl 5.16.2 was used
-for the kpcli port to Windows and, using cpanminus, one can install all
-of kpcli's dependencies, sans Term::ReadLine::Gnu which is optional for
-kpcli and not supported on MS Windows.
-
-Since version v3.5, kpcli supports using modules installed in one's
-home directory (under ~/perl5), on Unix-like systems. Without root
-authority, tools like cpanm will install to ~/perl5/ by default.
+Please see https://sf.net/p/kpcli/wiki/Installation%20instructions
 
 =head1 CAVEATS AND WORDS OF CAUTION
 
@@ -5882,6 +6068,16 @@ people use it daily, but it is not the author's primary use case. It is
 also the author's intent to maintain compatibility with v1 files, and so
 anyone sending patches, for consideration for inclusion in future kpcli
 versions, is asked to validate them with both v1 and v2 files.
+
+=head2 Version 4 of the KDBX file format is unsupported
+
+KeePass 2.35 introduced version 4 of the KDBX file format (KDBXv4) and
+it is unsuported by File::KeePass. File::KeePass can only decrypt
+databases encrypted with AES and newer KeePass versions offer
+ChaCha20, which will also save the file as KDBXv4. You can use the
+File -> Database Settings -> Security tab to change the encryption
+algorithm to AES/Rijndael and, as of KeePass 2.46, kpcli will be able
+to operate on the files. https://keepass.info/help/kb/kdbx_4.html
 
 =head2 Some versions of Term::ReadLine::Perl5 are incompatible
 
@@ -5953,177 +6149,177 @@ this program would not have been practical for me to author.
  2010-Nov-28 v0.2 - Encrypt the master password in RAM.
  2010-Nov-29 v0.3 - Fixed master password encryption for saveas.
  2010-Nov-29 v0.4 - Fixed code to work w/out Term::ReadLine::Gnu.
-                    Documented File::KeePass v0.1 hierarchy bug.
+                  - Documented File::KeePass v0.1 hierarchy bug.
  2010-Nov-29 v0.5 - Made find command case insensitive.
-                    Bugfix in new command (path regex problem).
+                  - Bugfix in new command (path regex problem).
  2010-Nov-29 v0.6 - Added lock file support; warn if a lock exists.
  2010-Dec-01 v0.7 - Further documented the group fields that are
                      dropped, in the CAVEATS section of the POD.
-                    Sort group and entry titles naturally.
+                  - Sort group and entry titles naturally.
  2010-Dec-23 v0.8 - Worked with File::KeePass author to fix a couple
                      of bugs and then required >=v0.03 of that module.
-                    Sorted "/_found" to last in the root group list.
-                    Fixed a "database changed" state bug in cli_save().
-                    Made the find command ignore entries in /Backup/.
-                    Find now offers show when only one entry is found.
-                    Provided a patch to Term::ShellUI author to add
+                  - Sorted "/_found" to last in the root group list.
+                  - Fixed a "database changed" state bug in cli_save().
+                  - Made the find command ignore entries in /Backup/.
+                  - Find now offers show when only one entry is found.
+                  - Provided a patch to Term::ShellUI author to add
                      eof_exit_hook and added support for it to kpcli.
  2011-Feb-19 v0.9 - Fixed bugs related to spaces in group names as
                      reported in SourceForge bug number 3132258.
-                    The edit command now prompts to save on changes.
-                    Put scrub_unknown_values_from_all_groups() calls
+                  - The edit command now prompts to save on changes.
+                  - Put scrub_unknown_values_from_all_groups() calls
                      back into place after realizing that v0.03 of
-                    File::KeePass did not resolve all of the problems.
+                     File::KeePass did not resolve all of the problems.
  2011-Apr-23 v1.0 - Changed a perl 5.10+ regex to a backward-compatable
                      one to resolve SourceForge bug number 3192413.
-                    Modified the way that the /Backup group is ignored
+                  - Modified the way that the /Backup group is ignored
                      by the find command to stop kpcli from croaking on
                      multiple entries with the same name in that group.
                      - Note: There is a more general bug here that
                              needs addressing (see BUGS section).
-                    An empty title on new entry aborts the new entry.
-                    Changed kdb files are now detected/warned about.
-                    Tested against Term::ShellUI v0.9, which has my EOF
+                  - An empty title on new entry aborts the new entry.
+                  - Changed kdb files are now detected/warned about.
+                  - Tested against Term::ShellUI v0.9, which has my EOF
                      hook patch, and updated kpcli comments about it.
-                    Term::ShellUI's complete_history() method was
+                  - Term::ShellUI's complete_history() method was
                      removed between v0.86 and v0.9 and so I removed
                      kpli's call to it (Ctrl-r works for history).
-                    Added the "icons" command.
+                  - Added the "icons" command.
  2011-Sep-07 v1.1 - Empty DBs are now initialized to KeePassX style.
-                    Fixed a couple of bugs in the find command.
-                    Fixed a password noecho bug in the saveas command.
-                    Fixed a kdb_has_changed bug in the saveas command.
-                    Fixed a cli_open bug where it wasn't cli_close'ing.
-                    Fixed variable init bugs in put_master_passwd().
-                    Fixed a false warning in warn_if_file_changed().
+                  - Fixed a couple of bugs in the find command.
+                  - Fixed a password noecho bug in the saveas command.
+                  - Fixed a kdb_has_changed bug in the saveas command.
+                  - Fixed a cli_open bug where it wasn't cli_close'ing.
+                  - Fixed variable init bugs in put_master_passwd().
+                  - Fixed a false warning in warn_if_file_changed().
  2011-Sep-30 v1.2 - Added the "export" command.
-                    Added the "import" command.
-                    Command "rmdir" asks then deletes non-empty groups.
-                    Command "new" can auto-generate random passwords.
+                  - Added the "import" command.
+                  - Command "rmdir" asks then deletes non-empty groups.
+                  - Command "new" can auto-generate random passwords.
  2012-Mar-03 v1.3 - Fixed bug in cl command as reported in SourceForge
                      bug number 3496544.
  2012-Apr-17 v1.4 - Added key file support based on a user contributed
                      patch with SourceForge ID# 3518388.
-                    Added my_help_call() to allow for longer and more
+                  - Added my_help_call() to allow for longer and more
                      descriptive command summaries (for help command).
-                    Stopped allowing empty passwords for export.
+                  - Stopped allowing empty passwords for export.
  2012-Oct-13 v1.5 - Fixed "help <foo>" commands, that I broke in v1.4.
-                    Command "edit" can auto-generate random passwords.
-                    Added the "cls" and "clear" commands from a patch
+                  - Command "edit" can auto-generate random passwords.
+                  - Added the "cls" and "clear" commands from a patch
                      with SourceForge ID# 3573930.
-                    Tested compatibility with File::KeePass v2.03 and
+                  - Tested compatibility with File::KeePass v2.03 and
                      made minor changes that are possible with >=2.01.
-                    With File::KeePass v2.03, kpcli should now support
+                  - With File::KeePass v2.03, kpcli should now support
                      KeePass v2 files (*.kdbx).
  2012-Nov-25 v1.6 - Hide passwords (red on red) in the show command
                      unless the -f option is given.
-                    Added the --readonly command line option.
-                    Added support for multi-line notes/comments;
+                  - Added the --readonly command line option.
+                  - Added support for multi-line notes/comments;
                      input ends on a line holding a single ".".
  2013-Apr-25 v1.7 - Patched to use native File::KeePass support for key
                      files, if the File::KeePass version is new enough.
-                    Added the "version" and "ver" commands.
-                    Updated documentation as Ubuntu 12.10 now packages
+                  - Added the "version" and "ver" commands.
+                  - Updated documentation as Ubuntu 12.10 now packages
                      all of kpcli's dependencies.
-                    Added --histfile command line option.
-                    Record modified times on edited records, from a
+                  - Added --histfile command line option.
+                  - Record modified times on edited records, from a
                      patch with SourceForge ID# 3611713.
-                    Added the -a option to the show command.
+                  - Added the -a option to the show command.
  2013-Jun-09 v2.0 - Removed the unused Clone module after a report that
                      Clone is no longer in core Perl as of v5.18.0.
-                    Added the stats and pwck commands.
-                    Added clipboard commands (xw/xu/xp/xx).
-                    Fixed some long-standing tab completion bugs.
-                    Warn if multiple groups or entries are titled the
+                  - Added the stats and pwck commands.
+                  - Added clipboard commands (xw/xu/xp/xx).
+                  - Fixed some long-standing tab completion bugs.
+                  - Warn if multiple groups or entries are titled the
                      same within a group, except for /Backup entries.
  2013-Jun-10 v2.1 - Fixed several more tab completion bugs, and they
                      were serious enough to warrant a quick release.
  2013-Jun-16 v2.2 - Trap and handle SIGINT (^C presses).
-                    Trap and handle SIGTSTP (^Z presses).
-                    Trap and handle SIGCONT (continues after ^Z).
-                    Stopped printing found dictionary words in pwck.
+                  - Trap and handle SIGTSTP (^Z presses).
+                  - Trap and handle SIGCONT (continues after ^Z).
+                  - Stopped printing found dictionary words in pwck.
  2013-Jul-01 v2.3 - More readline() and signal handling improvements.
-                    Title conflict checks in cli_new()/edit()/mv().
-                    Group title conflict checks in rename().
-                    cli_new() now accepts optional path&|title param.
-                    cli_ls() can now list multiple paths.
-                    cli_edit() now shows the "old" values for users
+                  - Title conflict checks in cli_new()/edit()/mv().
+                  - Group title conflict checks in rename().
+                  - cli_new() now accepts optional path&|title param.
+                  - cli_ls() can now list multiple paths.
+                  - cli_edit() now shows the "old" values for users
                      to edit, if Term::ReadLine::Gnu is available.
-                    cli_edit() now aborts all changes on ^C.
-                    cli_saveas() now asks before overwriting a file.
+                  - cli_edit() now aborts all changes on ^C.
+                  - cli_saveas() now asks before overwriting a file.
  2013-Nov-26 v2.4 - Fixed several "perl -cw" warnings reported on
                      2013-07-09 as SourceForge bug #9.
-                    Bug fix for the cl command, but in sub cli_ls().
-                    First pass at Strawberry perl/MS Windows support.
+                  - Bug fix for the cl command, but in sub cli_ls().
+                  - First pass at Strawberry perl/MS Windows support.
                      - Enhanced support for Term::ReadLine::Perl
                      - Added support for Term::ReadLine::Perl5
-                    Added display of expire time for show -a.
-                    Added -a option to the find command.
-                    Used the new magic_file_type() in a few places.
-                    Added generatePasswordFromDict() and "w" generation.
-                    Added the -v option to the version command.
+                  - Added display of expire time for show -a.
+                  - Added -a option to the find command.
+                  - Used the new magic_file_type() in a few places.
+                  - Added generatePasswordFromDict() and "w" generation.
+                  - Added the -v option to the version command.
                      - Added the versions command.
  2014-Mar-15 v2.5 - Added length control (gNN) to password generation.
-                    Added the copy command (and cp alias).
-                    Added the clone command.
-                    Added optional modules not installed to version -v.
-                    Groups can now also be moved with the mv command.
-                    Modified cli_cls() to also work on MS Windows.
-                    Suppressed Term::ReadLine::Gnu hint on MS Windows.
-                    Suppressed missing termcap warning on MS Windows.
-                    Print a min number of *s to not leak passwd length.
-                    Removed unneeded use of Term::ReadLine.
-                    Quieted "inherited AUTOLOAD for non-method" warns
+                  - Added the copy command (and cp alias).
+                  - Added the clone command.
+                  - Added optional modules not installed to version -v.
+                  - Groups can now also be moved with the mv command.
+                  - Modified cli_cls() to also work on MS Windows.
+                  - Suppressed Term::ReadLine::Gnu hint on MS Windows.
+                  - Suppressed missing termcap warning on MS Windows.
+                  - Print a min number of *s to not leak passwd length.
+                  - Removed unneeded use of Term::ReadLine.
+                  - Quieted "inherited AUTOLOAD for non-method" warns
                      caused by Term::Readline::Gnu on perl 5.14.x.
  2014-Jun-06 v2.6 - Added interactive password generation ("i" method).
                      - Thanks to Florian Tham for the idea and patch.
-                    Show entry's tags if present (KeePass >= v2.11).
+                  - Show entry's tags if present (KeePass >= v2.11).
                      - Thanks to Florian Tham for the patch.
-                    Add/edit support for tags if a v2 file is opened.
-                    Added tags to the searched fields for "find -a".
-                    Show string fields (key/val pairs) in v2 files.
-                    Add/edit for string fields if a v2 file is opened.
-                    Show information about entries' file attachments.
+                  - Add/edit support for tags if a v2 file is opened.
+                  - Added tags to the searched fields for "find -a".
+                  - Show string fields (key/val pairs) in v2 files.
+                  - Add/edit for string fields if a v2 file is opened.
+                  - Show information about entries' file attachments.
                      2014-03-20 SourceForge feature request #6.
-                    New "attach" command to manage file attachments.
-                    Added "Recycle Bin" functionality and --no-recycle.
-                    For --readonly, don't create a lock file and don't
+                  - New "attach" command to manage file attachments.
+                  - Added "Recycle Bin" functionality and --no-recycle.
+                  - For --readonly, don't create a lock file and don't
                      warn if one exists. 2014-03-27 SourceForge bug #11.
-                    Added key file generation to saveas and export.
+                  - Added key file generation to saveas and export.
                      2014-04-19 SourceForge bug #13.
-                    Added -expired option to the find command.
-                    Added "dir" as an alias for "ls"
-                    Added some additional info to the stats command.
-                    Added more detailed OS info for Linux/Win in vers.
-                    Now hides Meta-Info/SYSTEM entries.
-                    Fixed bug with SIGTSTP handling (^Z presses).
-                    Fixed missing refresh_state_all_paths() in cli_rm.
+                  - Added -expired option to the find command.
+                  - Added "dir" as an alias for "ls"
+                  - Added some additional info to the stats command.
+                  - Added more detailed OS info for Linux/Win in vers.
+                  - Now hides Meta-Info/SYSTEM entries.
+                  - Fixed bug with SIGTSTP handling (^Z presses).
+                  - Fixed missing refresh_state_all_paths() in cli_rm.
  2014-Jun-11 v2.7 - Bug fix release. Broke the open command in 2.6.
  2015-Feb-08 v2.8 - Fixed cli_copy bug; refresh paths and ask to save.
-                    Fixed a cli_mv bug; double path-normalization.
-                    Fixed a path display bug, if done after a cli_mv.
-                    Protect users from editing in the $FOUND_DIR.
-                    Keep file opened, read-only, to show up in lsof.
-                    Added inactivity locking (--timeout parameter).
-                    Added shell expansion support to cli_ls, with the
+                  - Fixed a cli_mv bug; double path-normalization.
+                  - Fixed a path display bug, if done after a cli_mv.
+                  - Protect users from editing in the $FOUND_DIR.
+                  - Keep file opened, read-only, to show up in lsof.
+                  - Added inactivity locking (--timeout parameter).
+                  - Added shell expansion support to cli_ls, with the
                      ability to manage _all_ listed entries by number.
-                    Added shell expansion support to cli_mv.
-                    Added [y/N] option to list entries after a find.
+                  - Added shell expansion support to cli_mv.
+                  - Added [y/N] option to list entries after a find.
  2015-Jun-19 v3.0 - Added Password Safe v3 file importing; requires
                      optional Crypt::PWSafe3 from CPAN.
-                    Added $FORCED_READLINE global variable.
-                    Attachments sanity check; SourceForge bug #17.
-                    Endianness fix in magic_file_type(); SF bug #19.
+                  - Added $FORCED_READLINE global variable.
+                  - Attachments sanity check; SourceForge bug #17.
+                  - Endianness fix in magic_file_type(); SF bug #19.
  2016-Jul-30 v3.1 - Added the purge command.
-                    Added Data::Password::passwdqc support to the
+                  - Added Data::Password::passwdqc support to the
                      pwck command and prefer it over Data::Password.
-                    Minor improvements in cli_pwck().
-                    Applied SF patch #6 from Chris van Marle.
-                    Addressed items pointed out in SF patch #7.
-                    In cli_save(), worked around a File::KeePass bug.
+                  - Minor improvements in cli_pwck().
+                  - Applied SF patch #6 from Chris van Marle.
+                  - Addressed items pointed out in SF patch #7.
+                  - In cli_save(), worked around a File::KeePass bug.
                      - rt.cpan.org tik# 113391; https://goo.gl/v65HKE
-                    Applied SF patch #8 from Maciej Grela.
-                    Optional better RNG; SF bug #30 from Aaron Toponce.
+                  - Applied SF patch #8 from Maciej Grela.
+                  - Optional better RNG; SF bug #30 from Aaron Toponce.
  2017-Dec-22 v3.2 - Added xpx command per the request in SF ticket #32.
                     Added autosave functionality (shadow copies).
                     Fixed a bug in new_edit_multiline_input() that was
@@ -6183,6 +6379,30 @@ this program would not have been practical for me to author.
                      with simpler calls to is_loaded(<foo>).
                   - Added several defined() tests that "use diagnostics"
                      pointed out on an older perl that I used (v5.10.1).
+ 2020-Oct-14 v3.6 - Allow multiple --command parameters and execute them
+                    in order, per SourceForge feature request #22.
+                  - Do a cli_ls() when find returns only one result and
+                    the user asks to show it. Fixes SourceForge bug #44.
+                  - Added --pwscmin and --pwscmax command line options,
+                    per SourceForge feature request #23.
+                  - Added --nopwstars per SF feature request #24.
+                  - Added --pwwords and --pwlen command line options.
+                  - Word-based generated passwords respect --pwlen.
+                  - Added cli_passwd() to change the DB password.
+                  - Only show help message when requested by --help, not
+                    also when there are command line option errors.
+                  - The cd command with no specified path now goes to /.
+                  - Improved open_kdb() error reporting after seeing
+                    https://bugzilla.redhat.com/show_bug.cgi?id=1820134
+                    and learning of the new kdbx v4 file format that
+                    File::KeePass does not support.
+                    Reference: https://keepass.info/help/kb/kdbx_4.html
+                  - New message requesting kpcli development sponsorship.
+                  - Removed the PREREQUISITES section from the POD and
+                    replaced it with INSTALLATION that simply refers the
+                    reader to the "Installation instructions" in the
+                    kpcli project Wiki on SourceForge.
+                  - Minor POD fixes.
 
 =head1 TODO ITEMS
 
@@ -6218,17 +6438,21 @@ this program would not have been practical for me to author.
 =pod OSNAMES
 
 =head2 Unix-like
-   - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
-   - As of version 3.5, development is done on Linux Mint 18.3.
-   - Known to work on many other Linux and *BSD distributions, and
-     kpcli is packaged with many distributions now-a-days.
-   - Known to work on macOS and is packaged in Homebrew (brew.sh).
-   - Will use modules installed under ~/perl5/. When not given root
-     permission, tools like cpanm install to ~/perl5/ by default.
+
+ - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
+ - As of version 3.5, development is done on Linux Mint 18.3.
+ - Known to work on many other Linux and *BSD distributions, and
+   kpcli is packaged with many distributions now-a-days.
+ - Known to work on macOS and is packaged in Homebrew (brew.sh).
+ - Will use modules installed under ~/perl5/. When not given root
+   permission, tools like cpanm install to ~/perl5/ by default.
 
 =head2 Microsoft Windows
-   - As of v2.4, Microsoft Windows is also supported.
-   - As of v3.5, compiled on Strawberry Perl 5.32.0.1 on Windows 10.
+
+ - As of v2.4, Microsoft Windows is also supported.
+ - As of v3.5, compiled on Strawberry Perl 5.32.0.1 on Windows 10.
+
+=head2 SCRIPT CATEGORIES
 
 =pod SCRIPT CATEGORIES
 
