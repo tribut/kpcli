@@ -25,7 +25,9 @@
 use 5.9.4;   # Version when Module::Loaded was added
 use strict;                                   # core
 use version;                                  # core
-#use diagnostics;                              # core
+use diagnostics;                              # core
+use Cwd qw(abs_path);                         # core
+use File::Copy qw(move);                      # core
 use File::Spec;                               # core
 use FileHandle;                               # core
 use Getopt::Long;                             # core
@@ -53,7 +55,26 @@ BEGIN {
   # Bail immediately if we're on Windows
   if (lc($^O) =~ m/^mswin/) { return 0; }
 
-  use File::Find qw(find); # In core perl since v5.8.0
+  # NOTE: Stopped using File::Find in here because doing so pulled
+  # in other modules that the user may prefer to load from ~/perl5.
+  # This was specifically a problem for List::Util when support was
+  # added to cli_pwck() for XData::Password::zxcvbn on perl v5.22.1.
+  sub get_dirs {
+    my $dir = shift @_;
+    if (! -d $dir) { return (); } # Nothing to do if $dir is not a dir
+    # Push all subdirs of $dir onto @d
+    my @d = ();
+    opendir(my $dh, $dir) || return ();
+    while ($_ = readdir($dh)) {
+      next if $_ eq "." or $_ eq "..";
+      my $fn = $dir . '/' . $_;
+      if (-d $fn) { push @d, $fn; }
+    }
+    closedir($dh);
+    # Look for directories in each subdirectory of $dir
+    my @d2=(); foreach (@d) { push @d2, get_dirs($_); }
+    return ($dir, @d2); # Return $dir and its subdirs
+  }
 
   # cPanelUserConfig.pm was the reference code from which I
   # built this, but I modified it substantially, to the
@@ -70,14 +91,8 @@ BEGIN {
 
   # Find all of .../auto/ directories in ~/perl5, chop the /auto off,
   # and append that list of directories to @add_paths.
-  my @auto_dirs;
-  find(sub {
-           push @auto_dirs,$File::Find::name
-		if (-d $File::Find::name && $File::Find::name =~ m%/auto$%);
-      }, $b__dir );
-  foreach my $i (0..$#auto_dirs) {
-    $auto_dirs[$i] =~ s%/auto$%%;
-  }
+  my @subdirs = get_dirs($b__dir);
+  my @auto_dirs = map { $_ =~ s%/auto$%%; $_; } grep(m%/auto$%, @subdirs);
   #warn "LHHD: \@auto_dirs:\n" . join("\n", @auto_dirs) . "\n\n";
 
   # Potential base set of ~/perl5 paths to be placed into @INC
@@ -189,11 +204,11 @@ my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.6";
+my $VERSION = "3.7";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 our $PASSWD_ECHO_CHAR = '*';
-my $opts = MyGetOpts(); # Will only return with options we think we can use
+our $opts = MyGetOpts(); # Will only return with options we think we can use
 
 my $doc_passwd_gen =
 	"For password generation, the \"g\" method produces a\n" .
@@ -206,7 +221,7 @@ my $doc_passwd_gen =
 	"are $DEFAULT_PASSWD_LEN characters long. " .
 				"That can be controlled by providing an\n" .
 	"integer immediately after the \"g|i\" in the range of "
-        			. "$DEFAULT_PASSWD_MIN-$DEFAULT_PASSWD_MAX.\n" .
+				. "$DEFAULT_PASSWD_MIN-$DEFAULT_PASSWD_MAX.\n" .
 	"For example, \"g17\" will generate a 17 character password.\n" .
 	"";
 # Setup our Term::ShellUI object
@@ -217,11 +232,10 @@ my $term = new Term::ShellUI(
     keep_quotes => 0,
     commands => {
          "autosave" => {
-             desc => "Describes the autosave functionality",
+             desc => "Autosave functionality",
              doc => "\n" . cli_autosave(undef,undef,1),
              method => \&cli_autosave,
              minargs => 0, maxargs => 1,
-	     exclude_from_history => 1,
              timeout_exempt => 1,
          },
          "ver" => {
@@ -323,8 +337,7 @@ my $term = new Term::ShellUI(
              desc => "Save to a specific filename " .
 				"(saveas <file.kdb> [<file.key>])",
              minargs => 1, maxargs => 2,
-             args => [\&Term::ShellUI::complete_onlyfiles,
-					\&Term::ShellUI::complete_onlyfiles],
+             args => [\&my_complete_onlyfiles, \&my_complete_onlyfiles],
              proc => sub { run_no_TSTP(\&cli_saveas, @_); },
          },
          "export" => {
@@ -340,8 +353,7 @@ my $term = new Term::ShellUI(
 		"Export from /, verify that the new file is good, and then\n" .
 		"remove your original file.\n",
              minargs => 1, maxargs => 2,
-             args => [\&Term::ShellUI::complete_onlyfiles,
-					\&Term::ShellUI::complete_onlyfiles],
+             args => [\&my_complete_onlyfiles, \&my_complete_onlyfiles],
              proc => sub { run_no_TSTP(\&cli_export, @_); },
          },
          "import" => {
@@ -353,16 +365,15 @@ my $term = new Term::ShellUI(
 		"Supported file types are KeePass v1 and v2, and\n" .
 		"Password Safe v3 (https://pwsafe.org/).\n",
              minargs => 2, maxargs => 3,
-             args => [\&Term::ShellUI::complete_onlyfiles,\&complete_groups,
-					\&Term::ShellUI::complete_onlyfiles],
+             args => [\&my_complete_onlyfiles,,\&complete_groups,
+					\&my_complete_onlyfiles],
              proc => sub { run_no_TSTP(\&cli_import, @_); },
          },
          "open" => {
              desc => "Open a KeePass database file " .
 				"(open <file.kdb> [<file.key>])",
              minargs => 1, maxargs => 2,
-             args => [\&Term::ShellUI::complete_onlyfiles,
-					\&Term::ShellUI::complete_onlyfiles],
+             args => [\&my_complete_onlyfiles, \&my_complete_onlyfiles],
              proc => sub { run_no_TSTP(\&cli_open, @_); },
          },
          "mkdir" => {
@@ -638,6 +649,7 @@ our $state={
 	'put_master_passwd' => \&put_master_passwd,
 	'get_master_passwd' => \&get_master_passwd,
 	'last_activity_time' => 0, # initilized by setup_timeout_handling()
+	'pwck_module' => load_pwck_module(),
 	};
 # If given --kdb=, open that file
 if (defined($opts->{kdb}) && length($opts->{kdb})) {
@@ -762,7 +774,7 @@ sub open_kdb {
 		"Error(s) from File::KeePass:\n$@";
     if (scalar(@load_db_warns)) {
       $errmsg .= "\nWarning(s) from File::KeePass:\n";
-      my @warns = map { 
+      my @warns = map {
 		my $t = $_;
 		$t =~ s/[^[:print:]]+//g;
 		$t =~ s/(Found an unknown header type) \((\d+).+$/$1: $2/;
@@ -1034,25 +1046,40 @@ sub run_no_TSTP {
   return @retval;
 }
 
-# Checks passwords for their quality
-sub cli_pwck {
-  my $self = shift @_;
-  my $params = shift @_;
+# pwck-related subroutines
+sub get_pwck_module {
   our $state;
+  if (defined($state->{pwck_module})) {
+    return $state->{pwck_module};
+  }
+  return undef;
+}
 
-  if (recent_sigint()) { return undef; } # Bail on SIGINT
+# The list of pwck modules that kpcli supports, listed in the
+# order of preference. The first found installed will be used.
+sub get_pwck_module_list {
+  my @pwckModules = qw(
+	Data::Password::zxcvbn
+	Data::Password::passwdqc
+	Data::Password
+	);
+  return @pwckModules;
+}
+
+sub load_pwck_module {
+  my $self = shift @_;
+
+  if (defined(get_pwck_module())) {
+    return 0; # Nothing to do. Already loaded.
+  }
 
   # Try to load one of the optional modules needed by this feature.
   # This list is in order of preference.
-  my @pwckModules = qw(Data::Password::passwdqc Data::Password);
-  my $pwckMethod = '';
+  my @pwckModules = get_pwck_module_list();
   pwckModules: foreach my $pwckmod (@pwckModules) {
-    # If it's already loaded then set $pwckMethod and bail out now
-    if (is_loaded($pwckmod)) {
-      $pwckMethod = $pwckmod;
-      last pwckModules;
-    }
-    # Try to load it. If we succeed, set $pwckMethod and bail out
+    # If it's already loaded then bail out now
+    if (is_loaded($pwckmod)) { return $pwckmod; }
+    # Try to load it. If we succeed, bail out
     if (runtime_load_module(\%OPTIONAL_PM,$pwckmod,undef)) {
       if ($pwckmod eq 'Data::Password::passwdqc') {
         no warnings 'once'; # These are intentionally only used once
@@ -1063,13 +1090,26 @@ sub cli_pwck {
         $Data::Password::MINLEN = 8;
         $Data::Password::MAXLEN = 0;
       }
-      $pwckMethod = $pwckmod;
-      last pwckModules;
+      return $pwckmod;
     }
   }
-  # If we could not get a module loaded, let the user know and bail out
-  if (! length($pwckMethod)) {
-    print "Error: pwck requires Data::Password or Data::Password::passwdqc.\n";
+  return undef;
+}
+
+# Checks passwords for their quality
+sub cli_pwck {
+  my $self = shift @_;
+  my $params = shift @_;
+  our $state;
+
+  if (recent_sigint()) { return undef; } # Bail on SIGINT
+
+  my $pwckMethod = get_pwck_module();
+
+  # If we have no pwck module loaded, let the user know and bail out
+  if (! defined($pwckMethod)) {
+    my $modsV = " - " . join("\n - ", get_pwck_module_list());
+    print "Error: pwck requires one of these modules:\n$modsV\n";
     return;
   }
 
@@ -1196,10 +1236,27 @@ sub my_IsBadPassword($) {
     my $pwdqc = Data::Password::passwdqc->new;
     my $is_valid = $pwdqc->validate_password($pass);
     $result = $pwdqc->reason if not $is_valid;
+  } elsif ($pwckMethod eq 'Data::Password::zxcvbn') {
+    my $strength = Data::Password::zxcvbn::password_strength($pass);
+    #print "LHHD: ".Dumper($strength)."\n";
+    if ($strength->{score} < 3) {
+      $result .= "Strength score is low at " . $strength->{score};
+      if (defined($strength->{feedback}->{warning}) &&
+		length($strength->{feedback}->{warning}) ) {
+        $result .= "\nWarning: " . $strength->{feedback}->{warning};
+      }
+      if (defined($strength->{feedback}->{suggestions}) &&
+		ref($strength->{feedback}->{suggestions}) eq 'ARRAY') {
+        $result .= "\nSuggestions:\n" .
+		" - " . join("\n - ", @{$strength->{feedback}->{suggestions}});
+        $result .= "\n";
+      }
+    }
   }
 
   return $result;
 }
+
 
 # Prints some statistics about the open KeePass file
 sub cli_stats {
@@ -1824,7 +1881,8 @@ sub cli_save($) {
 
   # Check for a lock file that we did not place there
   my $lock_file = $state->{kdb_file} . '.lock'; # KeePassX style
-  if (-f $lock_file && $state->{placed_lock_file} ne $lock_file) {
+  if (-f $lock_file && defined($state->{placed_lock_file}) &&
+				$state->{placed_lock_file} ne $lock_file) {
     print color('bold yellow') .  "WARNING:" . color('clear') .
         color('red') .
                " A KeePassX-style lock file is in place for this file.\n" .
@@ -1835,6 +1893,20 @@ sub cli_save($) {
     if (lc($key) ne 'y') {
       return;
     }
+  }
+
+  # Derive a temporary, savetmp file to write to.
+  my $kdb_savetmp = abs_path($state->{kdb_file});
+  $kdb_savetmp =~ s/([.]kdb.*)$/-savetmp$1/;
+  if ($kdb_savetmp eq abs_path($state->{kdb_file})) {
+    $kdb_savetmp = $kdb_savetmp . "-savetmp"; # Should never happen
+  }
+  unlink($kdb_savetmp) if (-e $kdb_savetmp);
+  if (-e $kdb_savetmp) {
+    print color('bold red') . "ERROR: " . color('clear') .
+	color('red') . "Something exists at path $kdb_savetmp!\n" .
+			"\nSave abandoned!\n" . color('clear');
+    return -1;
   }
 
   # If we got this far the user is OK with us locking the file even
@@ -1850,13 +1922,6 @@ sub cli_save($) {
   my $master_pass=
 	composite_master_pass($state->{get_master_passwd}(),$state->{key_file});
 
-  # We hold a read file handle open for no reason other than
-  # to show up in lsof. Close it prior to saving the database,
-  # else Windows has problems (reported in SF patch #11).
-  if (defined($state->{kdb_file_handle})) {
-    close $state->{kdb_file_handle};
-  }
-
   # Note: adding the 3rd parameter (header) here was in response to a bug reported
   # on 03/27/2016 via email to me from a person named marco. There is a bug in
   # File::KeePass that will make this save_db() call revert a V2 database to v1 if
@@ -1870,22 +1935,61 @@ sub cli_save($) {
   # and the filename does not end in kdbx, so that the impact of this change is
   # minimized across the user base.
   if ($state->{kdb_file} !~ m/\.kdbx$/i && $state->{kdb}->{header}->{version} == 2) {
-    $k->save_db($state->{kdb_file},$master_pass,$state->{kdb}->{header});
+    $k->save_db($kdb_savetmp,$master_pass,$state->{kdb}->{header});
   } else {
-    $k->save_db($state->{kdb_file},$master_pass);
+    $k->save_db($kdb_savetmp,$master_pass);
   }
-  $state->{kdb_has_changed}=0; # set our state to no change since last save
-  $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-  print "Saved to $state->{kdb_file}\n";
   $k->lock;
-  my $file = $state->{kdb_file};
+
+  # Validate that the $kdb_savetmp file can be opened
+  # (code copied from open_kdb() and slightly modified)
+  my @load_db_warns;
+  if (! eval { local $SIG{__WARN__} = sub { push @load_db_warns, @_; };
+		my $tmp_kdb = File::KeePass->new;
+		$tmp_kdb->load_db($kdb_savetmp, $master_pass) }) {
+    my $errmsg = "Couldn't load the new database file $kdb_savetmp\n\n" .
+		"Error(s) from File::KeePass:\n$@";
+    if (scalar(@load_db_warns)) {
+      $errmsg .= "\nWarning(s) from File::KeePass:\n";
+      my @warns = map {
+		my $t = $_;
+		$t =~ s/[^[:print:]]+//g;
+		$t =~ s/(Found an unknown header type) \((\d+).+$/$1: $2/;
+		$t; } @load_db_warns;
+      $errmsg .= " - " . join("\n - ", @warns) . "\n";
+    }
+    print color('bold red') . "ERROR: " . color('clear') .
+	color('red') . $errmsg . "\nSave abandoned!\n" . color('clear');
+    unlink($kdb_savetmp);
+    return -1;
+  }
+
+  # We hold a read file handle open for no reason other than
+  # to show up in lsof. Close it prior to saving the database,
+  # else Windows has problems (reported in SF patch #11).
+  if (defined($state->{kdb_file_handle})) {
+    close $state->{kdb_file_handle};
+  }
+
+  # Move $kdb_savetmp into its permanent place.
+  if (move($kdb_savetmp, $state->{kdb_file})) {
+    $state->{kdb_has_changed}=0; # set our state to no change since last save
+    $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    print "Saved to $state->{kdb_file}\n";
+  } else {
+    print color('bold red') . "ERROR: " . color('clear') .
+	color('red') .
+		"Failed to move $kdb_savetmp to $state->{kdb_file}" .
+	color('clear');
+    unlink($kdb_savetmp);
+  }
 
   # Reopen file handle to show up in lsof...
   $state->{kdb_file_handle} = new FileHandle;
-  open($state->{kdb_file_handle}, '<', $file);
+  open($state->{kdb_file_handle}, '<', $state->{kdb_file});
 
   # Update the md5sum of the file after we just saved it
-  $state->{kdb_file_md5} = Digest::file::digest_file_hex($file, "MD5");
+  $state->{kdb_file_md5} = Digest::file::digest_file_hex($state->{kdb_file}, "MD5");
 
   # Now handle any autosave entries that this database may have
   handle_autosaves();
@@ -2472,6 +2576,7 @@ sub cli_show($$) {
   my $self = shift @_;
   my $params = shift @_;
   our $state;
+  our $opts;
 
   if (recent_sigint()) { return undef; } # Bail on SIGINT
 
@@ -2493,10 +2598,12 @@ sub cli_show($$) {
     return -1;
   }
 
-  # Unless -f is specified, we "hide" the password as red-on-red.
+  # Unless -f is specified, we "hide" the password as red-on-red,
+  # unless --nopwprint is set, in which case we don't show it.
   my $password = $state->{kdb}->locked_entry_password($ent);
   if (! defined($opts{f})) {
     $password = colored(['red on_red'], $password);
+    if ($opts->{nopwprint}) { $password = undef; }
   }
   # 2FA-TOTP generation
   my $otp = undef;
@@ -2527,7 +2634,7 @@ sub cli_show($$) {
   print
 	show_format("Title",$ent->{title}) . "\n" .
 	show_format("Uname",$ent->{username}) . "\n" .
-	show_format("Pass",$password) . "\n" .
+	(defined($password) ? show_format("Pass",$password) . "\n" : '') .
 	(defined($otp) ? show_format("OTP",$otp) . "\n" : '') .
 	show_format("URL",$ent->{url}) . "\n" .
 	show_format("Notes",$notes) . "\n" .
@@ -3938,6 +4045,24 @@ sub cli_open($) {
   }
 }
 
+# Term::ShellUI::complete_onlyfiles does not work properly
+# on mswin and so we replace it with a call to our very
+# own my_nongnu_complete_files(). Ultimately, we replaced it
+# for all platforms because of other nagging bugs discovered.
+sub my_complete_onlyfiles {
+  my $self = $_[0];
+  if (1 || lc($^O) =~ m/^mswin/) {
+    my $cmpl = $_[1];
+    my $path = $cmpl->{tokens}->[$cmpl->{tokno}];
+    if (length($path) > $cmpl->{tokoff}) {
+      $path = substr($path, 0, $cmpl->{tokoff});
+    }
+    my @dir_contents = my_nongnu_complete_files($path, undef, undef, $self);
+    return \@dir_contents;
+  }
+  return &Term::ShellUI::complete_onlyfiles(@_);
+}
+
 # Get a single keypress from the user
 sub get_single_key {
   my $drain_first = shift @_ || 1;
@@ -4413,20 +4538,12 @@ sub expand_tildes {
 
 # Copied from Term::ShellUI and modified for enhanced Windows support
 sub my_nongnu_complete_files {
-    my ($str, $line, $start) = @_;
-
-    #$self->suppress_completion_append_character();
-    if (defined($readline::rl_completer_terminator_character)) {
-      $readline::rl_completer_terminator_character='';
-    }
-    if (defined($Term::ReadLine::Perl5::readline::rl_completer_terminator_character)) {
-      $Term::ReadLine::Perl5::readline::rl_completer_terminator_character='';
-    }
+    my ($str, $line, $start, $self) = @_;
 
     my ($volume,$directories,$file) = File::Spec->splitpath($str || '.', 0 );
     # This next line is for Windows tab completion on just "C:","D:", etc.
     if (length($volume) && !length($directories)) { $directories='/'; }
-    my $dir = File::Spec->catpath($volume,$directories,undef);
+    my $dir = File::Spec->catpath($volume,$directories,'');
 
     # eradicate non-matches immediately (this is important if
     # completing in a directory with 3000+ files)
@@ -4435,19 +4552,37 @@ sub my_nongnu_complete_files {
 
     my @files = ();
     if(opendir(DIR, length($dir) ? $dir : '.')) {
-        @files = grep { substr($_,0,$flen) eq $file } readdir DIR;
+        @files = readdir DIR;
         closedir DIR;
+        # Only on Windows, we do this in a case insensitive way.
+        if (lc($^O) =~ m/^mswin/) {
+          # Case insensitive matching.
+          @files = grep { lc(substr($_,0,$flen)) eq lc($file) } @files;
+          # The case of the @files that we return must match what the
+          # user has typed so far and that's what this substr does.
+          @files = map { substr($_, 0, length($file), $file); $_; } @files;
+        } else {
+          @files = grep { substr($_,0,$flen) eq $file } @files;
+        }
         # eradicate dotfiles unless user's file begins with a dot
         @files = grep { /^[^.]/ } @files unless $file =~ /^\./;
         # reformat filenames to be exactly as user typed
-        @files = map { length($dir) ? ($dir eq '/' ? "/$_" : "$dir/$_") : $_ } @files;
+        @files = map { length($dir) ? ($dir eq '/' ? "/$_" : $dir.$_) : $_ } @files;
     } else {
         print("Couldn't read dir: $!\n");
     }
 
     # Tack trailing slashs on dirs
+    my $dir_count = 0;
     foreach my $file_dir (@files) {
-      if (-d $file_dir && $file_dir !~m/\/$/) { $file_dir .= '/'; }
+      if (-d $file_dir && $file_dir !~m/\/$/) { $file_dir .= '/'; $dir_count++; }
+    }
+
+    # If there are no subdirs in the list of completions and there is
+    # only one file, then the completion is finished. Else, we need to
+    # suppress_completion_append_character().
+    if ($dir_count > 0 || scalar(@files) > 1) {
+      __my_suppress_completion_append_character($self);
     }
 
     return @files;
@@ -4492,6 +4627,18 @@ sub cli_autosave {
   my $self = shift @_;
   my $params = shift @_;
   my $no_print = shift @_ || 0;
+
+  # This section of code handles "autosave -f"
+  if (defined($params->{args})) {
+    my %opts=();
+    local @ARGV = @{$params->{args}};
+    my $result = &GetOptions(\%opts, 'f');
+    if ($opts{'f'}) {
+      handle_autosaves();
+      $no_print = 1;
+    }
+  }
+
   my $t="You can add entries to /$AUTOSAVES_DIR/ and, for each one, the save\n" .
 	"command will write the open kdb to the filename in the url field\n" .
 	"and with the entry's password. This can be used to keep copies\n" .
@@ -4504,6 +4651,9 @@ sub cli_autosave {
 	"\n" .
 	"When /$AUTOSAVES_DIR/ entries exist, the save command shows\n" .
 	"them and prompts the user for confirmation before execution.\n" .
+	"\n" .
+	"To process autosaves manually, apart from the save command,\n" .
+	"issue the command: autosave -f\n" .
 	"";
   if ($no_print) { return $t; } else { print $t; }
 }
@@ -4815,7 +4965,7 @@ sub GetPassword {
       kill SIGINT, $$; # Due to raw mode, I must send the SIGINT to myself.
       return '';
     } elsif (ord($c) == 127 || ord($c) == 8) { # backspace (Linux/Windows)
-      if (length($master_pass)) {
+      if (length($master_pass) && length($echo_char)) {
         print chr(8)." ".chr(8);
         chop($master_pass);
       }
@@ -4846,7 +4996,7 @@ sub MyGetOpts {
   my @params = (
 	"kdb=s", "key=s", "pwfile=s", "histfile=s",
 	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s@",
-	"nopwstars", "pwsplchars=s", "xpxsecs=i", "xclipsel=s",
+	"nopwstars", "nopwprint", "pwsplchars=s", "xpxsecs=i", "xclipsel=s",
 	"pwwords=s", "pwlen=i", "pwscmin=i", "pwscmax=i");
   my $result = &GetOptions(\%opts, @params);
 
@@ -4959,7 +5109,17 @@ sub MyGetOpts {
     push @errs, "--pwscmax cannot exceed --pwscmin, which defaults to 1.";
   }
 
+  # Sanity check the --xclipsel option if provided
   if (defined($opts{xclipsel}) && length($opts{xclipsel})) {
+    # First determine if --xclipsel is relevant and exit if not
+    if (! is_loaded("Clipboard")) {
+      print "--xclipsel is only relevant if the Clipboard module is installed.\n";
+      exit;
+    } elsif ($opts{xclipsel} eq 'help' && $Clipboard::driver ne 'Clipboard::Xclip') {
+      print "--xclipsel is only relevant on systems with X11.\n";
+      exit;
+    }
+    # Now validate the --xclipsel choice
     if (is_loaded("Clipboard") && $Clipboard::driver eq 'Clipboard::Xclip') {
       my @x11_sels = $Clipboard::driver->all_selections();
       unshift @x11_sels, 'all';
@@ -4979,9 +5139,6 @@ sub MyGetOpts {
           push @errs, $usemsg;
         }
       }
-    } elsif ($opts{xclipsel} eq 'help') { # help without Clipboard::Xclip
-      print "--xclipsel is only relevant on systems with X11.\n";
-      exit;
     }
   }
 
@@ -5038,6 +5195,7 @@ sub GetUsageMessage {
     [ 'pwscmin=i'  => "Min number of special chars in generated passwords." ],
     [ 'pwscmax=i'  => "Max number of special chars in generated passwords." ],
     [ 'nopwstars'  => "Don't show star characters (*) for password input." ],
+    [ 'nopwprint'  => "Don't print the pw red on red in the show command." ],
     [ 'xpxsecs=i'  =>
 		'Seconds to wait until clearing the clipboard for xpx.' ],
     [ 'xclipsel=s' => 'X11 clipboard to use; "--xclipsel help" for choices.' ],
@@ -5239,7 +5397,7 @@ sub complete_groups_and_entries {
 # so we get to the outcome via $readline::rl_completer_terminator_character.
 sub __my_suppress_completion_append_character($) {
   my $self = shift;
-  if ($self->{term}->ReadLine eq 'Term::ReadLine::Gnu') {
+  if (defined($self) && $self->{term}->ReadLine eq 'Term::ReadLine::Gnu') {
     $self->suppress_completion_append_character();
   } else {
     # For Term::ReadLine::Perl
@@ -6008,7 +6166,7 @@ sub magic_file_type($) {
   if ($header =~ m/^PWS3/) {
     return 'pws3';
   }
-  return undef;
+  return ''; # Intentionally not returning undef so diagnostics won't complain
 }
 
 # Unix-style, "touch" a file
@@ -6044,10 +6202,12 @@ kpcli - A command line interface to KeePass database files.
 =head1 DESCRIPTION
 
 A command line interface (interactive shell) to work with KeePass
-database files (http://en.wikipedia.org/wiki/KeePass).  This
-program was inspired by my use of "kedpm -c" combined with my need
-to migrate to KeePass. The curious can read about the Ked Password
-Manager at http://kedpm.sourceforge.net/.
+database files (http://en.wikipedia.org/wiki/KeePass). It supports
+all version 1.x (*.kdb) and 2.x (*.kdbx) prior to the KDBX4 update.
+
+This program was inspired by my use of "kedpm -c" combined with my
+need to migrate to KeePass. The curious can read about the Ked
+Password Manager at http://kedpm.sourceforge.net/.
 
 =head1 USAGE
 
@@ -6072,12 +6232,23 @@ versions, is asked to validate them with both v1 and v2 files.
 =head2 Version 4 of the KDBX file format is unsupported
 
 KeePass 2.35 introduced version 4 of the KDBX file format (KDBXv4) and
-it is unsuported by File::KeePass. File::KeePass can only decrypt
+it is unsupported by File::KeePass. File::KeePass can only decrypt
 databases encrypted with AES and newer KeePass versions offer
 ChaCha20, which will also save the file as KDBXv4. You can use the
 File -> Database Settings -> Security tab to change the encryption
 algorithm to AES/Rijndael and, as of KeePass 2.46, kpcli will be able
-to operate on the files. https://keepass.info/help/kb/kdbx_4.html
+to operate on the files.
+
+ - https://keepass.info/help/kb/kdbx_4.html
+ - https://metacpan.org/pod/Crypt::AuthEnc::ChaCha20Poly1305
+
+=head2 Filesystem Access and Tab Completion on Microsoft Windows
+
+Filesytem access and tab completion on Microsoft Windows uses forward
+slashes, and so paths like: c:/Users/hightowe/personal.kdb
+
+File tab completion is also case insensitive, which seems cumbersome,
+but it matches Windows filesystem behavior.
 
 =head2 Some versions of Term::ReadLine::Perl5 are incompatible
 
@@ -6128,6 +6299,20 @@ support those.  This program detects and alert when an opened database
 file has those issues, but it does not refuse to save (overwrite) a file
 that is opened like that. Saves are actually safe (no data loss) as long
 as the user has not touched one of the duplicately-named items.
+
+=head2 Text::Shellwords::Cursor parse_line() infinite loop
+
+There is a bug in Text::Shellwords::Cursor::parse_line() that will
+send it into an infinite loop. To trigger it, one need only try to
+do tab completion with an escape character as the last character on
+the command line. This perl one-liner demonstrates the problem:
+
+  $ perl -MData::Dumper -MText::Shellwords::Cursor \
+	-e '$p=Text::Shellwords::Cursor->new(); \
+	@t = $p->parse_line("open c:\\u"); print Dumper(\@t); \
+	@t = $p->parse_line("open c:\\"); print Dumper(\@t);'
+
+The second call to parse_line() will enter an infinite loop.
 
 =head1 AUTHOR
 
@@ -6344,7 +6529,7 @@ this program would not have been practical for me to author.
                   - Added some vers reporting of a few OS-specific
                      modules (around clipboard functionality).
                   - Added the "ver -vv" and "vers -v" options, for
-                     addional verbosity of version reporting.
+                     additional verbosity of version reporting.
                   - Added --pwsplchars option, as requested in
                      SourceForge feature request #19.
                   - Fixed a few new "perl -cw" warnings.
@@ -6403,11 +6588,45 @@ this program would not have been practical for me to author.
                     reader to the "Installation instructions" in the
                     kpcli project Wiki on SourceForge.
                   - Minor POD fixes.
+ 2022-May-19 v3.7 - Added my_complete_onlyfiles() and used it to work
+                    around Term::ShellUI problems with file tab
+                    completion on Windows, which now works properly.
+                  - File tab completion is now case-insensitive on mswin.
+                  - Now use my_complete_onlyfiles() for all platforms,
+                    after discovering some other Term::ShellUI file
+                    tab completion problems, even on Linux.
+                  - cli_pwck() now supports Data::Password::zxcvbn and it
+                    is the preferred pwck module, if it is installed.
+                     - Info: https://github.com/dropbox/zxcvbn
+                  - Added get_dirs() to the BEGIN block and stopped using
+                    File::Find after realizing that it somewhat defeated
+                    the purpose that I was trying to accomplish there.
+                  - Added --nopwprint per SF bug report #44.
+                  - Added the -f option to the autosave command.
+                  - Fixed a --nopwstars bug per SF bug report #47.
+                  - Enhanced validation of the --xclipsel option.
+                  - Minor POD fixes.
+                  - Added kdb_savetmp-related code to cli_save() to
+                    guard against problems like the one reported in
+                    Debian bug report #1006917.
 
 =head1 TODO ITEMS
 
   Consider adding support for setting the Expires date/time on entries
   when creating or editing them.
+
+  Consider enhancing pwck with these features:
+    - https://metacpan.org/pod/WebService::HIBP
+    - https://metacpan.org/pod/Password::Policy::Rule::Pwned
+  Inspired by tools such as:
+    - https://sts10.github.io/2019/02/01/medic.html
+    - https://github.com/gsurrel/keepwn
+
+  Consider alternative KeePass libraries due to stagnation of
+  File::KeePass. This python one seems to be well maintained and
+  supports KDBX3 and KDBX4: https://github.com/libkeepass/pykeepass
+  - https://www.debian.org/doc/packaging-manuals/python-policy
+  - https://pypi.org/project/stdeb/
 
   Consider adding support for TOTP with different digest algorithms
   than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
@@ -6440,7 +6659,7 @@ this program would not have been practical for me to author.
 =head2 Unix-like
 
  - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
- - As of version 3.5, development is done on Linux Mint 18.3.
+ - As of version 3.7, development is done on Linux Mint 19.3.
  - Known to work on many other Linux and *BSD distributions, and
    kpcli is packaged with many distributions now-a-days.
  - Known to work on macOS and is packaged in Homebrew (brew.sh).

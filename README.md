@@ -5,10 +5,12 @@ kpcli - A command line interface to KeePass database files.
 # DESCRIPTION
 
 A command line interface (interactive shell) to work with KeePass
-database files (http://en.wikipedia.org/wiki/KeePass).  This
-program was inspired by my use of "kedpm -c" combined with my need
-to migrate to KeePass. The curious can read about the Ked Password
-Manager at http://kedpm.sourceforge.net/.
+database files (http://en.wikipedia.org/wiki/KeePass). It supports
+all version 1.x (\*.kdb) and 2.x (\*.kdbx) prior to the KDBX4 update.
+
+This program was inspired by my use of "kedpm -c" combined with my
+need to migrate to KeePass. The curious can read about the Ked
+Password Manager at http://kedpm.sourceforge.net/.
 
 # USAGE
 
@@ -33,12 +35,23 @@ versions, is asked to validate them with both v1 and v2 files.
 ## Version 4 of the KDBX file format is unsupported
 
 KeePass 2.35 introduced version 4 of the KDBX file format (KDBXv4) and
-it is unsuported by File::KeePass. File::KeePass can only decrypt
+it is unsupported by File::KeePass. File::KeePass can only decrypt
 databases encrypted with AES and newer KeePass versions offer
 ChaCha20, which will also save the file as KDBXv4. You can use the
 File -> Database Settings -> Security tab to change the encryption
 algorithm to AES/Rijndael and, as of KeePass 2.46, kpcli will be able
-to operate on the files. https://keepass.info/help/kb/kdbx\_4.html
+to operate on the files.
+
+    - https://keepass.info/help/kb/kdbx_4.html
+    - https://metacpan.org/pod/Crypt::AuthEnc::ChaCha20Poly1305
+
+## Filesystem Access and Tab Completion on Microsoft Windows
+
+Filesytem access and tab completion on Microsoft Windows uses forward
+slashes, and so paths like: c:/Users/hightowe/personal.kdb
+
+File tab completion is also case insensitive, which seems cumbersome,
+but it matches Windows filesystem behavior.
 
 ## Some versions of Term::ReadLine::Perl5 are incompatible
 
@@ -89,6 +102,20 @@ support those.  This program detects and alert when an opened database
 file has those issues, but it does not refuse to save (overwrite) a file
 that is opened like that. Saves are actually safe (no data loss) as long
 as the user has not touched one of the duplicately-named items.
+
+## Text::Shellwords::Cursor parse\_line() infinite loop
+
+There is a bug in Text::Shellwords::Cursor::parse\_line() that will
+send it into an infinite loop. To trigger it, one need only try to
+do tab completion with an escape character as the last character on
+the command line. This perl one-liner demonstrates the problem:
+
+    $ perl -MData::Dumper -MText::Shellwords::Cursor \
+          -e '$p=Text::Shellwords::Cursor->new(); \
+          @t = $p->parse_line("open c:\\u"); print Dumper(\@t); \
+          @t = $p->parse_line("open c:\\"); print Dumper(\@t);'
+
+The second call to parse\_line() will enter an infinite loop.
 
 # AUTHOR
 
@@ -305,7 +332,7 @@ this program would not have been practical for me to author.
                      - Added some vers reporting of a few OS-specific
                         modules (around clipboard functionality).
                      - Added the "ver -vv" and "vers -v" options, for
-                        addional verbosity of version reporting.
+                        additional verbosity of version reporting.
                      - Added --pwsplchars option, as requested in
                         SourceForge feature request #19.
                      - Fixed a few new "perl -cw" warnings.
@@ -364,11 +391,45 @@ this program would not have been practical for me to author.
                        reader to the "Installation instructions" in the
                        kpcli project Wiki on SourceForge.
                      - Minor POD fixes.
+    2022-May-19 v3.7 - Added my_complete_onlyfiles() and used it to work
+                       around Term::ShellUI problems with file tab
+                       completion on Windows, which now works properly.
+                     - File tab completion is now case-insensitive on mswin.
+                     - Now use my_complete_onlyfiles() for all platforms,
+                       after discovering some other Term::ShellUI file
+                       tab completion problems, even on Linux.
+                     - cli_pwck() now supports Data::Password::zxcvbn and it
+                       is the preferred pwck module, if it is installed.
+                        - Info: https://github.com/dropbox/zxcvbn
+                     - Added get_dirs() to the BEGIN block and stopped using
+                       File::Find after realizing that it somewhat defeated
+                       the purpose that I was trying to accomplish there.
+                     - Added --nopwprint per SF bug report #44.
+                     - Added the -f option to the autosave command.
+                     - Fixed a --nopwstars bug per SF bug report #47.
+                     - Enhanced validation of the --xclipsel option.
+                     - Minor POD fixes.
+                     - Added kdb_savetmp-related code to cli_save() to
+                       guard against problems like the one reported in
+                       Debian bug report #1006917.
 
 # TODO ITEMS
 
     Consider adding support for setting the Expires date/time on entries
     when creating or editing them.
+
+    Consider enhancing pwck with these features:
+      - https://metacpan.org/pod/WebService::HIBP
+      - https://metacpan.org/pod/Password::Policy::Rule::Pwned
+    Inspired by tools such as:
+      - https://sts10.github.io/2019/02/01/medic.html
+      - https://github.com/gsurrel/keepwn
+
+    Consider alternative KeePass libraries due to stagnation of
+    File::KeePass. This python one seems to be well maintained and
+    supports KDBX3 and KDBX4: https://github.com/libkeepass/pykeepass
+    - https://www.debian.org/doc/packaging-manuals/python-policy
+    - https://pypi.org/project/stdeb/
 
     Consider adding support for TOTP with different digest algorithms
     than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
@@ -399,7 +460,7 @@ this program would not have been practical for me to author.
 ## Unix-like
 
     - Originally written and tested on Ubuntu Linux 10.04.1 LTS.
-    - As of version 3.5, development is done on Linux Mint 18.3.
+    - As of version 3.7, development is done on Linux Mint 19.3.
     - Known to work on many other Linux and *BSD distributions, and
       kpcli is packaged with many distributions now-a-days.
     - Known to work on macOS and is packaged in Homebrew (brew.sh).
