@@ -36,14 +36,21 @@ versions, is asked to validate them with both v1 and v2 files.
 
 KeePass 2.35 introduced version 4 of the KDBX file format (KDBXv4) and
 it is unsupported by File::KeePass. File::KeePass can only decrypt
-databases encrypted with AES and newer KeePass versions offer
-ChaCha20, which will also save the file as KDBXv4. You can use the
-File -> Database Settings -> Security tab to change the encryption
-algorithm to AES/Rijndael and, as of KeePass 2.46, kpcli will be able
-to operate on the files.
+databases encrypted with the AES cipher and newer KeePass versions
+offer ChaCha20, which will also save the file as KDBXv4. File::KeePass
+also does not support the new Argon2 key derivation function (KDF).
 
     - https://keepass.info/help/kb/kdbx_4.html
     - https://metacpan.org/pod/Crypt::AuthEnc::ChaCha20Poly1305
+
+As of KeePass 2.46, you can use the "File -> Database Settings ->
+Security" tab to set the encryption algorithm to AES/Rijndael and
+the key derivation function to AES-KDF and then kpcli will be able
+to operate on the files.
+
+As of KeePassXC 2.7, you can use the "Database -> Database Security ->
+Encryption Settings" tab to change the "Database format" to "KDBX 3"
+kpcli will be able to operate on the files.
 
 ## Filesystem Access and Tab Completion on Microsoft Windows
 
@@ -412,6 +419,13 @@ this program would not have been practical for me to author.
                      - Added kdb_savetmp-related code to cli_save() to
                        guard against problems like the one reported in
                        Debian bug report #1006917.
+    2022-Jul-21 v3.8 - Added get/set commands per SF feature request #27.
+                     - Added version detection for KDBX files.
+                     - Added the KDBX version in the stats output.
+                     - Now reports that KDBX4 files cannot be opened.
+                     - Can now import KDBX4 files using KeePassXC.
+                     - Added deny_if_readonly() to import command.
+    22-Jul-21 v3.8.1 - Fixed get/set commands bug. See SF feature req #27.
 
 # TODO ITEMS
 
@@ -426,10 +440,9 @@ this program would not have been practical for me to author.
       - https://github.com/gsurrel/keepwn
 
     Consider alternative KeePass libraries due to stagnation of
-    File::KeePass. This python one seems to be well maintained and
-    supports KDBX3 and KDBX4: https://github.com/libkeepass/pykeepass
-    - https://www.debian.org/doc/packaging-manuals/python-policy
-    - https://pypi.org/project/stdeb/
+    File::KeePass. CPAN module File::KDBX is available as of
+    April 30, 2022! KDBX4 support will likely be coming in a
+    future version of kpcli, by way of File::KDBX.
 
     Consider adding support for TOTP with different digest algorithms
     than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
@@ -437,11 +450,22 @@ this program would not have been practical for me to author.
     of the OTP to be something other than six digits. None of those
     options are broadly used today, but when writing the TOTP code, I
     stumbled across a few. I did not implement it now primarily because
-    Authen::OATH isn't very condusive to using other digest algorithms.
-    For future reference, I'd likely construct the strings like this:
+    Authen::OATH is not very condusive to using other digest algorithms.
+    For future reference, would likely construct the strings like this:
       2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
     This code may prove useful if I decide to not use Authen::OATH:
     https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
+
+    Consider adding TOTP storage support that is compatible with the
+    way that KeePassXC provides it.
+
+    By design, kpcli displays groups and entries in the hierarchy
+    and order that they are stored in the keepass files. This is
+    by design as the output then follows the hierarchey seen in
+    grapical programs like KeePass and KeePassXC. Users may prefer
+    to have groups and entries sorted. Consider adding a sort
+    command and/or a command line option that would change the
+    behavior of ls to sort its output (perhaps --sortls).
 
     Consider adding a tags command for use with v2 files.
      - To navigate by entry tags
