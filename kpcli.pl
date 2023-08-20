@@ -46,6 +46,7 @@ use Time::Piece;                              # core
 use Time::Seconds;                            # core
 use Module::Loaded qw(is_loaded);             # core
 use POSIX;                   # core, required for unsafe signal handling
+$Data::Dumper::Sortkeys = 1;
 
 # This BEGIN code is used to unshift local perl module paths (~/perl5/*)
 # onto @INC to allow users to install modules for kpcli into thier homedirs
@@ -201,10 +202,11 @@ my $DEfAULT_BAKUP_ICON = 2;  # In keepassx, icon 2 is a warning sign
 my $FOUND_DIR = '_found';    # The find command's results go in /_found/
 my $AUTOSAVES_DIR = '_autosaves'; # The place where auto-saves are kept
 my $MAX_ATTACH_SIZE = 2*1024**2;  # Maximum size of entry file attachments
+my $KPXC_MIN_VER = '2.7.1';
 
 # Application name and version
 my $APP_NAME = basename($0);  $APP_NAME =~ s/\.(pl|exe)$//;
-my $VERSION = "3.7";
+my $VERSION = "3.8.1";
 
 our $HISTORY_FILE = ""; # Gets set in the MyGetOpts() function
 our $PASSWD_ECHO_CHAR = '*';
@@ -465,6 +467,39 @@ my $term = new Term::ShellUI(
          "stats" => {
              desc => "Prints statistics about the open KeePass file",
              method => \&cli_stats,
+         },
+         "set" => {
+             desc => "Set a value: get <entry path|entry number> <field> <val>",
+             doc => "\n" .
+		"The set command can take a path to an entry or an entry\n".
+		"number (from the ls command), as its first argument,\n".
+		"the field to change as its second argument, and that\n".
+		"field's new value as the third argument.\n".
+		"\n" .
+		"When using entry numbers, they will refer to the last\n" .
+		"path when an ls was performed or pwd if ls has not\n" .
+		"yet been run.\n" .
+		"",
+             minargs => 3, maxargs => 3,
+             args => [ \&complete_groups_and_entries,
+			\&complete_get_set_fields ],
+             method => \&cli_set,
+         },
+         "get" => {
+             desc => "Get a value: get <entry path|entry number> <field>",
+             doc => "\n" .
+		"The get command can take a path to an entry or an entry\n".
+		"number (from the ls command), as its first argument\n".
+		"and the field to display as its second argument.\n".
+		"\n" .
+		"When using entry numbers, they will refer to the last\n" .
+		"path when an ls was performed or pwd if ls has not\n" .
+		"yet been run.\n" .
+		"",
+             minargs => 2, maxargs => 2,
+             args => [ \&complete_groups_and_entries,
+			\&complete_get_set_fields ],
+             method => \&cli_get,
          },
          "show" => {
              desc => "Show an entry: show [-f] [-a] <entry path|entry number>",
@@ -730,6 +765,17 @@ sub open_kdb {
     return "Does not appear to be a KeePass file: $file";
   }
 
+  my $finf = kp_file_info($file);
+  if ($finf->{version} == 2 and $finf->{kdbx_ver} >= 4.0) {
+    return color('yellow') .
+	"KDBX4 files are not directly supported, but they can be imported.\n" .
+	color('clear') .
+	" - The KDBX format is supported through version 3.1.\n" .
+	" - To import a KDBX v4 file, use the import command.\n" .
+	" - For details, see: help import\n" .
+	"";
+  }
+
   # Look for lock file and warn if it is found
   my $lock_file = $file . '.lock'; # KeePassX style
   if (-f $lock_file &&
@@ -799,6 +845,9 @@ sub open_kdb {
   $state->{kdb_file} = $file;
   $state->{key_file} = $key_file;
   $state->{kdb_ver} = $state->{kdb}->{header}->{version}; # will be 1 or 2
+  if (defined($finf->{kdbx_ver})) {
+    $state->{kdbx_ver} = $finf->{kdbx_ver};
+  }
   $state->{put_master_passwd}($master_pass);
   $state->{kdb_has_changed}=0;
   $master_pass="\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -1320,7 +1369,12 @@ sub cli_stats {
   }
   if (defined($hdr->{version}) && defined($hdr->{enc_type}) &&
 					defined($hdr->{rounds})) {
-    $t .= "KeePass file version: " . $hdr->{version} . "\n" .
+    $t .= "KeePass file version: " . $hdr->{version};
+    if (defined($state->{kdbx_ver})) {
+      $t .= " and KDBX v$state->{kdbx_ver}";
+    }
+
+    $t .= "\n" .
 	  "Encryption type:      " . $hdr->{enc_type} . "\n" .
 	  "Encryption rounds:    " . $hdr->{rounds} . "\n";
   }
@@ -2572,6 +2626,93 @@ sub cli_otp($$) {
   return -1;
 }
 
+# get/set commands
+sub get_set_fields_map {
+  my $h = {
+	title    => 'Title',
+	username => 'Uname',
+	password => 'Pass',
+	url      => 'URL',
+	comment  => 'Notes',
+	id       => 'ID',
+	};
+  my $rh = {};
+  foreach my $k (keys %{$h}) {
+    $rh->{$h->{$k}} = $k;
+  }
+  return ($h,$rh);
+}
+sub complete_get_set_fields {
+  my $self = shift;
+  my $cmpl = shift;
+  my ($flds,$rflds) = get_set_fields_map();
+  my @completions = sort(uniq((keys %{$flds}, keys %{$rflds})));
+  my $path = $cmpl->{tokens}->[$cmpl->{tokno}];
+  @completions = grep(/^$path/, @completions);
+  return \@completions;
+}
+sub cli_get($$) {
+  my $self = shift @_;
+  my $params = shift @_;
+  return(getter_setter($self, 'get', $params));
+}
+sub cli_set($$) {
+  my $self = shift @_;
+  my $params = shift @_;
+  return(getter_setter($self, 'set', $params));
+}
+sub getter_setter($$$) {
+  my $self = shift @_;
+  my $action = shift @_;
+  my $params = shift @_;
+  our $state;
+  our $opts;
+
+  my ($target, $field, $newval) = @{$params->{args}};
+
+  # Validate and resolve the field
+  my ($flds,$rflds) = get_set_fields_map();
+  if (! defined($field)) {
+    print "Invalid field name.\n";
+    return -1;
+  }
+  if (defined($rflds->{$field})) { $field = $rflds->{$field}; }
+  if (! defined($flds->{$field})) {
+    print "Invalid field name.\n";
+    return -1;
+  }
+
+  my $ent=find_target_entity_by_number_or_path($target);
+  if (! defined($ent)) {
+    print "Invalid entry path.\n";
+    return -1;
+  }
+
+  if ($action eq 'get') {
+    $state->{kdb}->unlock; # Required for the password field
+    print "$ent->{$field}\n" if defined($ent->{$field});
+    $state->{kdb}->lock;
+    return 0;
+  } elsif ($action eq 'set') {
+    if (! defined($newval)) {
+      print "You must provide a new value to set for the field.\n";
+      return -1;
+    }
+    # Update the field
+    $state->{kdb}->unlock; # Required for the password field
+    $ent->{$field} = $newval;
+    $state->{kdb}->lock;
+    $ent->{modified} = $state->{kdb}->now;
+    refresh_state_all_paths();
+    $state->{kdb_has_changed}=1;
+  } else {
+    print "BUG in how getter_setter() was called! Please report.\n";
+  }
+
+  return undef;
+}
+# END: get/set commands
+
 sub cli_show($$) {
   my $self = shift @_;
   my $params = shift @_;
@@ -3457,7 +3598,7 @@ sub cli_import {
   }
   # Make sure the new group's parent exists
   my ($grp_path,$grp_name)=normalize_and_split_raw_path($new_group_path);
-  if ($grp_path != '' && ! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
+  if ($grp_path ne '' && ! defined($state->{all_grp_paths_fwd}->{$grp_path})) {
     print "Path does not exist: /" . humanize_path($grp_path) . "\n";
     return -1;
   }
@@ -3583,6 +3724,15 @@ sub cli_import_keepass {
   my $parent_group = shift @_;
   our $state;
 
+  if (deny_if_readonly()) { return; }
+
+  my $finf = kp_file_info($file);
+  # If this is a KDBX4 file we handoff to that routine
+  if ($finf->{version} == 2 and $finf->{kdbx_ver} >= 4.0) {
+    return import_keepass_KDBX4($file,$master_pass,$key_file,$grp_name,$parent_group);
+  }
+
+  # Import v1 and v2 through KDBX version 3.1
   my $iKDB = File::KeePass->new;
   if (! eval { $iKDB->load_db($file,
 			composite_master_pass($master_pass, $key_file)) }) {
@@ -3609,6 +3759,263 @@ sub cli_import_keepass {
   refresh_state_all_paths();
   $state->{kdb_has_changed}=1;
   RequestSaveOnDBChange();
+}
+
+sub import_keepass_KDBX4 {
+  my $file = shift @_;
+  my $master_pass = shift @_;
+  my $key_file = shift @_;
+  my $grp_name = shift @_;
+  my $parent_group = shift @_;
+  our $state;
+
+  # This requires KeePassXC so notify the user if we don't have it
+  my $can_kpxc = can_kpxc($opts->{kpxcexe}, $KPXC_MIN_VER);
+  if (! $can_kpxc) {
+    print color('yellow') .
+      "KeePassXC $KPXC_MIN_VER or newer is required to import KDBX4 files.\n".
+      color('clear') .
+      "You must also specify the full path to the KeePassXC program using\n".
+      "the --kpxcexe commmand line parameter. Provide the path to the\n".
+      "keepassxc-cli command or to the KeePassXC AppImage binary.\n" .
+      " - https://keepassxc.org/download/\n".
+      "";
+    return -1;
+  }
+
+  # This requires Expect so try to load it if we don't have it.
+  # https://metacpan.org/pod/Expect / libexpect-perl
+  if  (! is_loaded('Expect')) {
+    runtime_load_module(\%OPTIONAL_PM,'Expect',[qw()]);
+  }
+  if (! is_loaded('Expect')) {
+    print "Perl module Expect is required for this functionality.\n";
+    return -1;
+  }
+
+  # Gather the KDBX4 file's entries into the $ents hash
+  my $timeout = 3; # seconds
+  my $ents = gather_kdbx4_entries($file,$master_pass,$key_file,$timeout);
+  if (! defined($ents)) {
+    print "The import failed via $opts->{kpxcexe}.\n";
+    return -1;
+  }
+  if (ref($ents) ne 'HASH') {
+    print "The import failed with error:\n$ents\n";
+    return -1;
+  }
+
+  # Add the new group, to its parent or to root if $parent_group==undef
+  my $k=$state->{kdb};
+  my $top_imp_grp=$k->add_group({
+        title => $grp_name,
+        group => $parent_group,
+        });
+
+  # Add all of the entities from the import
+  my %new_grps = ();
+  foreach my $full_path (sort keys (%{$ents})) {
+    my ($name,$path,$suffix) = fileparse($full_path);
+    $path =~ s%/+$%%;
+    # Ensure all that groups exist to put this $ent into
+    my @path_parts = File::Spec->splitdir($path);
+    for my $i (0..$#path_parts) {
+      my $new_path = File::Spec->catdir(@path_parts[0..$i]);
+      if (!defined($new_grps{$new_path})) {
+        if ($i == 0) {
+          $new_grps{$new_path} = $k->add_group({
+		title => $new_path,
+		group => $top_imp_grp,
+		});
+        } elsif ($i > 0) {
+          my ($dir_name,$p_path,$suffix) = fileparse($new_path);
+          $p_path =~ s%/+$%%;
+          $new_grps{$new_path} = $k->add_group({
+		title => $dir_name,
+		group => $new_grps{$p_path},
+		});
+        }
+      }
+    }
+    # Now add the entity
+    my %new_ent = ();
+    $new_ent{id} = int(rand(1000000000000000)); # A random new id
+    $new_ent{group} = $new_grps{$path};
+    $new_ent{title} = $name;
+    # Loop over fields to add (uname, passwd, etc.)
+    my $h = { # KeePassXC to File::KeePass key map
+        username => 'UserName',
+        password => 'Password',
+        url      => 'URL',
+        comment  => 'Notes',
+        };
+    foreach my $k (sort keys %{$h}) {
+      $new_ent{$k} = $ents->{$full_path}->{$h->{$k}};
+    }
+    # Place the new entity into our file
+    $k->unlock;
+    $k->add_entry(\%new_ent);
+    $k->lock;
+  }
+
+  refresh_state_all_paths();
+  $state->{kdb_has_changed}=1;
+  RequestSaveOnDBChange();
+}
+
+# Use Expect and "keepassxc cli" to gather the data from a kdbx4 file
+# NOTE: As of 07/18/2022, the Expect module does not work on
+# MS Windows except for within Cygwin. This code should work
+# if that ever changes, but for now, only Cygwin users benefit.
+sub gather_kdbx4_entries {
+  my $kdbx_file = shift @_ || undef;
+  my $kdbx_pass = shift @_ || undef;
+  my $kdbx_keyf = shift @_ || undef;
+  my $timeout = shift @_ || 3;
+  my $patidx;
+
+  my @kpxc_opts = ();
+  # If not keepassxc-cli (like an AppImage), "cli" is needed.
+  if ($opts->{kpxcexe} !~ m/-cli([.]exe)$/i) {
+    push @kpxc_opts, 'cli';
+  }
+  # Always need "open" (that's what we're doing.
+  push @kpxc_opts, 'open';
+  # Determine if we need --no-password or not
+  my $expect_pword = 1;
+  if (not (defined($kdbx_pass) && length($kdbx_pass) > 1)) {
+    push(@kpxc_opts, '--no-password');
+    $expect_pword = 0;
+  }
+  # Determine if we need --key-file= or not
+  if (defined($kdbx_keyf) && length($kdbx_keyf) > 0) {
+    push(@kpxc_opts, "--key-file=$kdbx_keyf");
+  }
+
+  my $exp = Expect->new;
+  $exp->log_stdout(0);  # Else everything echos
+  #$exp->notransfer(1);
+  #$exp->exp_internal(1);
+  #$exp->log_file("./expect.log");
+  #$exp->raw_pty(1);
+  $exp->spawn($opts->{kpxcexe}, @kpxc_opts, $kdbx_file)
+	or return "Cannot spawn $opts->{kpxcexe}: $!\n";
+
+  # Use Expect to provide the password at the prompt
+  if ($expect_pword) {
+    my $prompt = "Enter password to unlock $kdbx_file:";
+    $patidx = $exp->expect($timeout, '-re', '^'.$prompt);
+    if (! defined($patidx)) { return undef; } # Failed to see password prompt
+    $exp->send($kdbx_pass."\n");
+    $exp->clear_accum();
+  }
+
+  my $prompt = '[^>]+>\s+';
+  $patidx = $exp->expect($timeout, '-re', '^'.$prompt);
+  if (! defined($patidx)) {
+    my $errmsg = $exp->before();
+    $errmsg =~ s/\r//g;
+    if ($errmsg =~ m/error /i) { return $errmsg; }
+    return undef;
+  }
+  $prompt = $exp->match();
+  $prompt =~ s/^[\r\n]+//g;
+  $prompt =~ s/[\r\n]+$//g;
+  $exp->set_accum('');
+
+  # Complete ls of the entire database
+  my @ls_lines = ();
+  {
+    my $ls_cmd = "ls -R -f\n";
+    $exp->send($ls_cmd);
+    $patidx = $exp->expect($timeout, '-re', '^'.$prompt);
+    my $ls_results = $exp->before();
+    $ls_results =~ tr/\r//d;
+    @ls_lines = split( "\n", $ls_results );
+    if ($ls_cmd =~ m/^$ls_lines[0]\s*$/) {
+      shift @ls_lines;
+    }
+    #print Dumper(\@ls_lines) . "\n";
+  }
+
+  my @groups = sort grep(m%/$%, @ls_lines);
+  my @entries = sort grep(m%[^/]$%, @ls_lines);
+  @entries = sort grep(! m%/[[]empty[]]$%, @entries); # Remove empty folders
+  #print Dumper(\@groups, \@entries) . "\n";
+
+  my %ents = ();
+  foreach my $entry (@entries) {
+    my $show_cmd = "show --show-protected --show-attachments \"$entry\"\n";
+    $exp->send($show_cmd);
+    $patidx = $exp->expect($timeout, '-re', '^'.$prompt);
+    my $show_results = $exp->before();
+    $show_results =~ tr/\r//d;
+    my @show_lines = split( "\n", $show_results );
+    if ($show_cmd =~ m/^$show_lines[0]\s*$/) {
+      shift @show_lines;
+    }
+    my $ent = {};
+    my $last_k = undef;
+    LINE: foreach my $line (@show_lines) {
+      if ($line =~ m/^\w+:/) {
+        my ($k, $v) = split(/:\s*/, $line, 2);
+        $ent->{$k} = $v;
+        $last_k = $k;
+      } else {
+        if ($last_k eq 'Notes' && $line =~ m/No attachments present\./) {next LINE;}
+        $ent->{$last_k} .= "\n" . $line;
+      }
+    }
+    $ents{$entry} = $ent;
+  }
+
+  # Cleanup entries
+  foreach my $entry (@entries) {
+    if (defined($ents{$entry}->{Notes})) {
+      $ents{$entry}->{Notes} =~ s/[\r\n]+$//;
+    }
+    if (defined($ents{$entry}->{Attachments})) {
+      my @atts = grep(!/^$/, split(/[\r\n]+/, $ents{$entry}->{Attachments}));
+      @atts = map { $_ =~ s/^\s*//; $_; } @atts;
+      foreach my $i (0..$#atts) {
+        # 'power_outages.txt (1.2 KiB)'
+        if ($atts[$i] =~ m/^(.+) [(]([^)]+)[)]$/) {
+          $atts[$i] = {name => $1, size => $2};
+        }
+      }
+      $ents{$entry}->{Attachments} = \@atts;
+    }
+  }
+  #print Dumper(\%ents) . "\n";
+
+  # Gather attachements
+  foreach my $entry (@entries) {
+    if (defined($ents{$entry}->{Attachments})) {
+      foreach my $att (@{$ents{$entry}->{Attachments}}) {
+        my @tmpdir = File::Spec->splitdir(File::Spec->tmpdir());
+        my $tmpfile = File::Spec->catfile(@tmpdir, "kpcli-kpxc-$$.tmp");
+        unlink $tmpfile;
+        my $att_cmd = "attachment-export \"$entry\" \"$att->{name}\" \"$tmpfile\"\n";
+        #print $att_cmd . "\n";
+        $exp->send($att_cmd);
+        $patidx = $exp->expect($timeout, '-re', '^'.$prompt);
+        my $att_results = $exp->before();
+        if (-f -r $tmpfile) {
+          my $data = slurp_read_file($tmpfile);
+          unlink $tmpfile;
+          $att->{data} = $data;
+        }
+        #print "$att_results\n";
+      }
+    }
+  }
+  #print Dumper(\%ents) . "\n";
+
+  # Exit from keepassxc-cli
+  $exp->send( "quit\n" );
+  $exp->soft_close();
+
+  return (\%ents);
 }
 
 sub cli_passwd() {
@@ -4997,7 +5404,7 @@ sub MyGetOpts {
 	"kdb=s", "key=s", "pwfile=s", "histfile=s",
 	"help", "h", "readonly", "no-recycle", "timeout=i", "command=s@",
 	"nopwstars", "nopwprint", "pwsplchars=s", "xpxsecs=i", "xclipsel=s",
-	"pwwords=s", "pwlen=i", "pwscmin=i", "pwscmax=i");
+	"pwwords=s", "pwlen=i", "pwscmin=i", "pwscmax=i", "kpxcexe=s");
   my $result = &GetOptions(\%opts, @params);
 
   my $use_help_msg = "Use --help to see information on command line options.";
@@ -5142,6 +5549,13 @@ sub MyGetOpts {
     }
   }
 
+  if (defined($opts{kpxcexe})) {
+     if (! (-f -x $opts{kpxcexe} && can_kpxc($opts{kpxcexe}, $KPXC_MIN_VER))) {
+       print "--kpxcexe does not point to a KeePassXC binary >= v$KPXC_MIN_VER.\n";
+       exit -1;
+     }
+  }
+
   if (scalar(@errs)) {
     warn "There were errors:\n" .
 	"  " . join("\n  ", @errs) . "\n\n";
@@ -5199,6 +5613,7 @@ sub GetUsageMessage {
     [ 'xpxsecs=i'  =>
 		'Seconds to wait until clearing the clipboard for xpx.' ],
     [ 'xclipsel=s' => 'X11 clipboard to use; "--xclipsel help" for choices.' ],
+    [ 'kpxcexe=s'  => 'Path to a KeePassXC binary, used to import KDBX4 files.' ],
     [ help         => 'This message.' ],
   );
   my $t="Usage: $APP_NAME [--kdb=<file.kdb>] [--key=<file.key>]\n" .
@@ -6169,6 +6584,214 @@ sub magic_file_type($) {
   return ''; # Intentionally not returning undef so diagnostics won't complain
 }
 
+# https://gist.github.com/lgg/e6ccc6e212d18dd2ecd8a8c116fb1e45
+sub kp_file_info {
+  my $filename = shift @_;
+  my $header='';
+  my $fh = FileHandle->new($filename, "r");
+  if (defined $fh) {
+    my $n = read $fh, $header, 256*1;
+    close $fh;
+  }
+
+  use constant KP_FILE_SIG   => 0x9AA2D903;
+  use constant KP_VERSIG_v1  => 0xB54BFB65;
+  use constant KP_VERSIG_v2  => 0xB54BFB67;
+
+  my ($file_sig, $ver_sig) = unpack 'LL', $header; # Two first longs from the header
+  if ($file_sig != KP_FILE_SIG) {
+    return undef; # Not a KeePass file
+  }
+
+  my $i = {}; # To collect our info
+
+  # 1.x (KDB) or 2.x (KDBX)
+  #>4      lelong	0xB54BFB65	1.x KDB
+  #>4      lelong	0xB54BFB67	2.x KDBX
+  $i->{version} = 'unknown';
+  $i->{ext} = 'unknown';
+  my $version_data = substr($header, 4, 4);
+  #print "LHHD: version_data=" . sprintf('%v02X', $version_data) . "\n";
+  if ($ver_sig == KP_VERSIG_v1) {
+    $i->{version} = 1;
+    $i->{ext} = 'kdb';
+  } elsif ($ver_sig == KP_VERSIG_v2) {
+    $i->{version} = 2;
+    $i->{ext} = 'kdbx';
+  } else {
+    return $i;
+  }
+
+  # Parse v1 header (*.kdb files)
+  my $parsed_header = undef;
+  if ($i->{version} == 1) {
+    $parsed_header = _parse_v1_header($header);
+  }
+  if ($i->{version} == 2) {
+    $parsed_header = _parse_v2_header($header);
+  }
+  if (defined($parsed_header)) {
+    foreach my $k (keys %{$i}) {
+      $parsed_header->{$k} = $i->{$k};
+    }
+    return $parsed_header;
+  }
+
+  return $i;
+}
+
+# Copied from File::KeePass and slightly modified
+sub _parse_v1_header {
+    my ($buffer) = @_;
+    use constant DB_HEADSIZE_V1   => 124;
+    my $size = length($buffer);
+    die "File was smaller than db header ($size < ".DB_HEADSIZE_V1().")\n" if $size < DB_HEADSIZE_V1;
+    my %h = (version => 1, header_size => DB_HEADSIZE_V1);
+    my @f = qw(sig1 sig2 flags ver seed_rand enc_iv n_groups n_entries checksum seed_key rounds);
+    my $t =   'L    L    L     L   a16       a16    L        L         a32      a32      L';
+    @h{@f} = unpack $t, $buffer;
+
+    # From https://gist.github.com/lgg/e6ccc6e212d18dd2ecd8a8c116fb1e45
+    my %ciphers = (
+	1 => 'SHA-256',
+	2 => 'AES / Rijndael', # also know as rijndael
+	4 => 'RC4',
+	8 => 'Twofish',
+	);
+    CIPH_ID: foreach my $cipher_num (sort keys %ciphers) {
+      if ($h{'flags'} & $cipher_num) {
+        $h{'enc_type'} = $cipher_num;
+        $h{'enc_name'} = $ciphers{$cipher_num};
+      }
+    }
+    return \%h;
+}
+
+# Copied from File::KeePass and slightly modified by following
+# this code: https://github.com/Evidlo/examples/blob/master/python/kdbx4_decrypt.py
+sub _parse_v2_header {
+    my ($buffer) = @_;
+    #my %h = (version => 2, enc_type => 'rijndael');
+    #@h{qw(sig1 sig2 ver)} = unpack 'L3', $buffer;
+    my %h = (version => 2, enc_type => 'rijndael');
+    @h{qw(sig1 sig2 ver_min ver_maj)} = unpack 'L2 s s', $buffer;
+    $h{'kdbx_ver'} = $h{ver_maj}.'.'.$h{ver_min};
+    #die "Unsupported file version2 ($h{'ver'}).\n" if $h{'ver'} & 0xFFFF0000 > 0x00020000 & 0xFFFF0000;
+    my $pos = 12;
+
+    HEADER: while (1) {
+        my ($type, $size);
+        if ($h{ver_maj} == 3) { # KDBX3
+          ($type, $size) = unpack "\@$pos CS", $buffer;
+          $pos += 3;
+        } elsif ($h{ver_maj} == 4) { # KDBX4
+          ($type, $size) = unpack "\@$pos CL", $buffer;
+          $pos += 5;
+        }
+        #warn "LHHD: pos/type/size = $pos: $type, $size\n";
+        my $val = substr $buffer, $pos, $size; # #my ($val) = unpack "\@$pos a$size", $buffer;
+        if (!$type) {
+            $h{'0'} = $val;
+            $pos += $size;
+            last HEADER;
+        }
+        $pos += $size;
+        if ($type == 1) {
+            $h{'comment'} = $val;
+        } elsif ($type == 2) {
+            #warn "Cipher id did not match AES\n" if $val ne "\x31\xc1\xf2\xe6\xbf\x71\x43\x50\xbe\x58\x05\x21\x6a\xfc\x5a\xff";
+            #$h{'cipher'} = 'aes';
+        } elsif ($type == 3) {
+            $val = unpack 'V', $val;
+            warn "Compression was too large.\n" if $val > 1;
+            $h{'compression'} = $val;
+        } elsif ($type == 4) {
+            warn "Length of seed random was not 32\n" if length($val) != 32;
+            $h{'seed_rand'} = $val;
+        } elsif ($type == 5) {
+            warn "Length of seed key was not 32\n" if length($val) != 32;
+            $h{'seed_key'} = $val;
+        } elsif ($type == 6) {
+            $h{'rounds'} = unpack 'L', $val;
+        } elsif ($type == 7) {
+            #warn "Length of encryption IV was not 16\n" if length($val) != 16;
+            $h{'enc_iv'} = $val;
+        } elsif ($type == 8) {
+            #warn "Length of stream key was not 32\n" if length($val) != 32;
+            $h{'protected_stream_key'} = $val;
+        } elsif ($type == 9) {
+            #warn "Length of start bytes was not 32\n" if length($val) != 32;
+            $h{'start_bytes'} = $val;
+        } elsif ($type == 10) {
+            #warn "Inner stream id did not match Salsa20\n" if unpack('V', $val) != 2;
+            $h{'protected_stream'} = 'salsa20';
+        } elsif ($type == 11) {
+            $h{'kdf_parameters'} = _parse_kdf_parameters($val);
+            #warn "LHHD: ".Dumper($h{'kdf_parameters'})."\n";
+        } elsif ($type == 12) {
+            # Plugin-provided data is stored in the header field with ID 12.
+        } else {
+            #warn "Found an unknown header type ($type, $val)\n";
+        }
+    }
+
+    $h{'header_size'} = $pos;
+    return \%h;
+}
+
+# https://github.com/Evidlo/examples/blob/master/python/kdbx4_decrypt.py
+# The KeePassXC source code, in ../src/format/KeePass2.cpp, contains many
+# constants that we care about, such as the values for the KDF $UUID key.
+sub _parse_kdf_parameters {
+  my $buffer = shift @_;
+
+  my $value_types = {
+    0x04 => 'I',
+    0x05 => 'Q',
+    0x08 => '?',
+    0x0C => 'i',
+    0x0D => 'q',
+    0x18 => '{length}s',
+    0x42 => '{length}s',
+  };
+
+  my %h = ();
+  my $kdf_offset = 0;
+
+  my $dict_version = unpack('H', substr($buffer,0,2));
+  #warn "LHHD: dict_version=$dict_version\n";
+  $kdf_offset += 2;
+
+  while (unpack('c',substr($buffer,$kdf_offset, 1)) != 0) {
+    my ($value_type, $key_size) = unpack('cL<',substr($buffer,$kdf_offset));
+    #warn "LHHD: value_type/format,key_size, = ($value_type/$value_types->{$value_type}, $key_size)\n";
+    $kdf_offset += 1 + 4;
+    my $key = substr($buffer,$kdf_offset, $key_size);
+    $kdf_offset += $key_size;
+    my ($value_size) = unpack('L<', substr($buffer,$kdf_offset));
+    $kdf_offset += 4;
+    my $value = substr($buffer,$kdf_offset, $value_size);
+    $kdf_offset += $value_size;
+    #warn "  LHHD: key,value_size,value = ($key, $value_size, $value)\n";
+    #warn "  LHHD: key,value_size,value = ($key, $value_size, ".unpack('H*', $value)."\n";
+    $h{$key} = $value;
+  }
+
+  # Convert the UUID from binary to hex and then to UUID format
+  if (defined($h{'$UUID'})) {
+    my $hex = lc(unpack('H*', $h{'$UUID'}));
+    $h{'$UUID'} = '';
+    my @lens = qw(8 4 4 4 12);
+    my $offset = 0;
+    foreach my $len (@lens) {
+      if (length($h{'$UUID'})) { $h{'$UUID'} .= '-'; }
+      $h{'$UUID'} .= substr($hex, $offset, $len);
+      $offset += $len;
+    }
+  }
+  return \%h;
+}
+
 # Unix-style, "touch" a file
 sub touch_file {
   my $filename = shift @_;
@@ -6189,6 +6812,42 @@ return($retval);
 sub uniq {
   my %seen;
   return grep { !$seen{$_}++ } @_;
+}
+
+sub slurp_read_file {
+  my $fn = shift @_;
+  my $fh = FileHandle->new();
+  open $fh, '<', $fn or return undef;
+  local $/ = undef;
+  my $data = <$fh>;
+  close $fh;
+  return $data;
+}
+
+# Tests to see if the kpxc_exe command exists, is runnable,
+# and is a good version versus $KPXC_MIN_VER.
+sub can_kpxc {
+  my $kpxc_exe = shift @_;
+  my $min_ver = shift @_;
+  if (! (-f -e $kpxc_exe)) { return 0; }
+  {
+    my $fh_kpxc = new FileHandle;
+    my $cmd = "$kpxc_exe --version";
+    if (lc($OSNAME) !~ m/^mswin/) { $cmd .= ' 2>/dev/null'; }
+    if (! open($fh_kpxc, '-|', $cmd)) {
+      return 0;
+    }
+    my $ver_str = <$fh_kpxc>;
+    close $fh_kpxc;
+    $ver_str =~ s/[\r\n]+$//;
+    if ($ver_str =~ m/^(KeePassXC )?(\d+[.]\d+[.]\d+)/i) {
+      my $kpxcver = $2;
+      if (version->parse($kpxcver) >= version->parse($min_ver)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 ########################################################################
@@ -6233,14 +6892,21 @@ versions, is asked to validate them with both v1 and v2 files.
 
 KeePass 2.35 introduced version 4 of the KDBX file format (KDBXv4) and
 it is unsupported by File::KeePass. File::KeePass can only decrypt
-databases encrypted with AES and newer KeePass versions offer
-ChaCha20, which will also save the file as KDBXv4. You can use the
-File -> Database Settings -> Security tab to change the encryption
-algorithm to AES/Rijndael and, as of KeePass 2.46, kpcli will be able
+databases encrypted with the AES cipher and newer KeePass versions
+offer ChaCha20, which will also save the file as KDBXv4. File::KeePass
+also does not support the new Argon2 key derivation function (KDF).
+
+  - https://keepass.info/help/kb/kdbx_4.html
+  - https://metacpan.org/pod/Crypt::AuthEnc::ChaCha20Poly1305
+
+As of KeePass 2.46, you can use the "File -> Database Settings ->
+Security" tab to set the encryption algorithm to AES/Rijndael and
+the key derivation function to AES-KDF and then kpcli will be able
 to operate on the files.
 
- - https://keepass.info/help/kb/kdbx_4.html
- - https://metacpan.org/pod/Crypt::AuthEnc::ChaCha20Poly1305
+As of KeePassXC 2.7, you can use the "Database -> Database Security ->
+Encryption Settings" tab to change the "Database format" to "KDBX 3"
+kpcli will be able to operate on the files.
 
 =head2 Filesystem Access and Tab Completion on Microsoft Windows
 
@@ -6609,6 +7275,13 @@ this program would not have been practical for me to author.
                   - Added kdb_savetmp-related code to cli_save() to
                     guard against problems like the one reported in
                     Debian bug report #1006917.
+ 2022-Jul-21 v3.8 - Added get/set commands per SF feature request #27.
+                  - Added version detection for KDBX files.
+                  - Added the KDBX version in the stats output.
+                  - Now reports that KDBX4 files cannot be opened.
+                  - Can now import KDBX4 files using KeePassXC.
+                  - Added deny_if_readonly() to import command.
+ 22-Jul-21 v3.8.1 - Fixed get/set commands bug. See SF feature req #27.
 
 =head1 TODO ITEMS
 
@@ -6623,10 +7296,9 @@ this program would not have been practical for me to author.
     - https://github.com/gsurrel/keepwn
 
   Consider alternative KeePass libraries due to stagnation of
-  File::KeePass. This python one seems to be well maintained and
-  supports KDBX3 and KDBX4: https://github.com/libkeepass/pykeepass
-  - https://www.debian.org/doc/packaging-manuals/python-policy
-  - https://pypi.org/project/stdeb/
+  File::KeePass. CPAN module File::KDBX is available as of
+  April 30, 2022! KDBX4 support will likely be coming in a
+  future version of kpcli, by way of File::KDBX.
 
   Consider adding support for TOTP with different digest algorithms
   than just SHA-1, such as SHA-256 and SHA-512. Also consider allowing
@@ -6634,11 +7306,22 @@ this program would not have been practical for me to author.
   of the OTP to be something other than six digits. None of those
   options are broadly used today, but when writing the TOTP code, I
   stumbled across a few. I did not implement it now primarily because
-  Authen::OATH isn't very condusive to using other digest algorithms.
-  For future reference, I'd likely construct the strings like this:
+  Authen::OATH is not very condusive to using other digest algorithms.
+  For future reference, would likely construct the strings like this:
     2FA-TOTP-SHA256: TheBase32SecretKeyProvided (30, 10)
   This code may prove useful if I decide to not use Authen::OATH:
   https://github.com/j256/perl-two-factor-auth/blob/master/totp.pl
+
+  Consider adding TOTP storage support that is compatible with the
+  way that KeePassXC provides it.
+
+  By design, kpcli displays groups and entries in the hierarchy
+  and order that they are stored in the keepass files. This is
+  by design as the output then follows the hierarchey seen in
+  grapical programs like KeePass and KeePassXC. Users may prefer
+  to have groups and entries sorted. Consider adding a sort
+  command and/or a command line option that would change the
+  behavior of ls to sort its output (perhaps --sortls).
 
   Consider adding a tags command for use with v2 files.
    - To navigate by entry tags
